@@ -247,12 +247,14 @@ function generateReadRules(
       const regexPattern = globToRegex(normalizedPath)
       rules.push(
         `(allow file-read*`,
-        `  (regex ${escapePath(regexPattern)}))`,
+        `  (regex ${escapePath(regexPattern)})`,
+        `  (with message "${logTag}"))`,
       )
     } else {
       rules.push(
         `(allow file-read*`,
-        `  (subpath ${escapePath(normalizedPath)}))`,
+        `  (subpath ${escapePath(normalizedPath)})`,
+        `  (with message "${logTag}"))`,
       )
     }
   }
@@ -686,10 +688,7 @@ export function wrapCommandWithSandboxMacOS(
   // Determine if we have restrictions to apply
   // Read: denyOnly pattern - empty array means no restrictions
   // Write: allowOnly pattern - undefined means no restrictions, any config means restrictions
-  const hasReadRestrictions =
-    readConfig &&
-    (readConfig.denyOnly.length > 0 ||
-      (readConfig.allowWithinDeny?.length ?? 0) > 0)
+  const hasReadRestrictions = readConfig && readConfig.denyOnly.length > 0
   const hasWriteRestrictions = writeConfig !== undefined
 
   // No sandboxing needed
