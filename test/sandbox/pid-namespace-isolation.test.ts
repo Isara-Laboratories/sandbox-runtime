@@ -1,10 +1,7 @@
 import { describe, it, expect, beforeAll } from 'bun:test'
 import { spawnSync } from 'node:child_process'
 import { existsSync } from 'node:fs'
-import {
-  getApplySeccompBinaryPath,
-  getPreGeneratedBpfPath,
-} from '../../src/sandbox/generate-seccomp-filter.js'
+import { getApplySeccompBinaryPath } from '../../src/sandbox/generate-seccomp-filter.js'
 import {
   wrapCommandWithSandboxLinux,
   checkLinuxDependencies,
@@ -24,13 +21,12 @@ import { isLinux } from '../helpers/platform.js'
  */
 
 let applySeccomp: string | null = null
-let bpfFilter: string | null = null
 
 function runApplySeccomp(
   args: string[],
   opts: { timeout?: number } = {},
 ): { status: number | null; stdout: string; stderr: string } {
-  const r = spawnSync(applySeccomp!, [bpfFilter!, ...args], {
+  const r = spawnSync(applySeccomp!, args, {
     stdio: 'pipe',
     timeout: opts.timeout ?? 10000,
   })
@@ -44,13 +40,10 @@ function runApplySeccomp(
 describe.if(isLinux)('apply-seccomp PID namespace isolation', () => {
   beforeAll(() => {
     applySeccomp = getApplySeccompBinaryPath()
-    bpfFilter = getPreGeneratedBpfPath()
-    // On Linux CI with vendor/seccomp files present these always resolve.
-    // If they're null, every test below would silently no-op — fail here.
+    // On Linux CI with the vendor binary present this always resolves.
+    // If null, every test below would silently no-op — fail here.
     expect(applySeccomp).toBeTruthy()
-    expect(bpfFilter).toBeTruthy()
     expect(existsSync(applySeccomp!)).toBe(true)
-    expect(existsSync(bpfFilter!)).toBe(true)
   })
 
   // ------------------------------------------------------------------
@@ -103,16 +96,7 @@ describe.if(isLinux)('apply-seccomp PID namespace isolation', () => {
     // workload.
     const r = spawnSync(
       'timeout',
-      [
-        '--preserve-status',
-        '-s',
-        'TERM',
-        '1',
-        applySeccomp!,
-        bpfFilter!,
-        'sleep',
-        '10',
-      ],
+      ['--preserve-status', '-s', 'TERM', '1', applySeccomp!, 'sleep', '10'],
       { stdio: 'pipe', timeout: 10000 },
     )
     expect(r.status).toBe(128 + 15)
@@ -286,33 +270,6 @@ describe.if(isLinux)('apply-seccomp PID namespace isolation', () => {
     ])
     expect(r.status).toBe(0)
   })
-
-  // ------------------------------------------------------------------
-  // Fail-closed: namespace setup failures must abort
-  // ------------------------------------------------------------------
-
-  it('fails closed when the BPF filter is missing', () => {
-    const r = spawnSync(
-      applySeccomp!,
-      ['/nonexistent/filter.bpf', 'echo', 'x'],
-      {
-        stdio: 'pipe',
-        timeout: 5000,
-      },
-    )
-    expect(r.status).not.toBe(0)
-    expect(r.stdout?.toString() ?? '').not.toContain('x')
-  })
-
-  it('fails closed when the BPF filter is malformed', () => {
-    // /etc/hostname is not a multiple of 8 bytes and not a valid BPF program.
-    const r = spawnSync(applySeccomp!, ['/etc/hostname', 'echo', 'leaked'], {
-      stdio: 'pipe',
-      timeout: 5000,
-    })
-    expect(r.status).not.toBe(0)
-    expect(r.stdout?.toString() ?? '').not.toContain('leaked')
-  })
 })
 
 describe.if(isLinux)(
@@ -320,9 +277,7 @@ describe.if(isLinux)(
   () => {
     beforeAll(() => {
       applySeccomp = getApplySeccompBinaryPath()
-      bpfFilter = getPreGeneratedBpfPath()
       expect(applySeccomp).toBeTruthy()
-      expect(bpfFilter).toBeTruthy()
       // CI apt-installs bwrap and socat; if missing the suite would no-op.
       expect(checkLinuxDependencies().errors).toEqual([])
     })
@@ -337,7 +292,7 @@ describe.if(isLinux)(
           'SLEEP_OUTER=$!',
           'for p in /proc/[0-9]*; do cat "$p/comm" 2>/dev/null; done | grep -qx sleep',
           'OUTER_SAW=$?',
-          `${applySeccomp} ${bpfFilter} sh -c '` +
+          `${applySeccomp} sh -c '` +
             'for p in /proc/[0-9]*; do cat "$p/comm" 2>/dev/null; done | grep -qx sleep; ' +
             'echo "INNER_SAW=$?"' +
             `'`,
