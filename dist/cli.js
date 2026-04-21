@@ -61,7 +61,7 @@ async function main() {
             }
             // Initialize sandbox with config
             logForDebugging('Initializing sandbox...');
-            await SandboxManager.initialize(runtimeConfig);
+            await SandboxManager.initialize(runtimeConfig, undefined, !!process.env.SRT_DEBUG);
             // Set up control fd for dynamic config updates if specified
             let controlReader = null;
             if (options.controlFd !== undefined) {
