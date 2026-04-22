@@ -645,10 +645,6 @@ async function wrapWithSandbox(
     customConfig?.network?.allowedDomains !== undefined ||
     config?.network?.allowedDomains !== undefined
 
-  // Network RESTRICTION is needed whenever network config is specified
-  // This includes empty allowedDomains which means "block all network"
-  const needsNetworkRestriction = hasNetworkConfig
-
   // When allowAllDomains is true, skip the proxy entirely — there is nothing
   // to filter, and routing through the MITM proxy breaks clients (like
   // urllib3-based SDKs) that bypass HTTP_PROXY and do direct DNS lookups.
@@ -658,6 +654,12 @@ async function wrapWithSandbox(
     customConfig?.network?.allowAllDomains ??
     config?.network?.allowAllDomains ??
     false
+
+  // Network RESTRICTION is needed whenever network config is specified,
+  // UNLESS allowAllDomains is true — in that case the Seatbelt profile must
+  // emit (allow network*) rather than the proxy-only outbound rules, otherwise
+  // all internet traffic is blocked when no proxy ports are passed.
+  const needsNetworkRestriction = hasNetworkConfig && !allowAllDomains
 
   // Network PROXY is needed whenever network config is specified
   // Even with empty allowedDomains, we route through proxy so that:

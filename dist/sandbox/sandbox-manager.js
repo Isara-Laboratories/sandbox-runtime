@@ -496,14 +496,24 @@ async function wrapWithSandbox(command, binShell, customConfig, abortSignal) {
     // An empty allowedDomains array means "no domains allowed" = block all network access
     const hasNetworkConfig = customConfig?.network?.allowedDomains !== undefined ||
         config?.network?.allowedDomains !== undefined;
-    // Network RESTRICTION is needed whenever network config is specified
-    // This includes empty allowedDomains which means "block all network"
-    const needsNetworkRestriction = hasNetworkConfig;
+    // When allowAllDomains is true, skip the proxy entirely — there is nothing
+    // to filter, and routing through the MITM proxy breaks clients (like
+    // urllib3-based SDKs) that bypass HTTP_PROXY and do direct DNS lookups.
+    // Direct connections are safe because Seatbelt/bubblewrap still enforces
+    // the rest of the profile.
+    const allowAllDomains = customConfig?.network?.allowAllDomains ??
+        config?.network?.allowAllDomains ??
+        false;
+    // Network RESTRICTION is needed whenever network config is specified,
+    // UNLESS allowAllDomains is true — in that case the Seatbelt profile must
+    // emit (allow network*) rather than the proxy-only outbound rules, otherwise
+    // all internet traffic is blocked when no proxy ports are passed.
+    const needsNetworkRestriction = hasNetworkConfig && !allowAllDomains;
     // Network PROXY is needed whenever network config is specified
     // Even with empty allowedDomains, we route through proxy so that:
     // 1. updateConfig() can enable network access for already-running processes
     // 2. The proxy blocks all requests when allowlist is empty
-    const needsNetworkProxy = hasNetworkConfig;
+    const needsNetworkProxy = hasNetworkConfig && !allowAllDomains;
     // Wait for network initialization only if proxy is actually needed
     if (needsNetworkProxy) {
         await waitForNetworkInitialization();
