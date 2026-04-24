@@ -21,7 +21,7 @@
     "lint:check": "eslint 'src/**/*.ts' --cache --cache-location=node_modules/.cache/.eslintcache",
     "format": "prettier --write 'src/**/*.ts' --cache --log-level warn",
     "prepublishOnly": "npm run clean && npm run build && cp -r vendor dist/",
-    "prepare": "husky"
+    "prepare": "husky || true"
   },
   "dependencies": {
     "@pondwader/socks5-server": "^1.0.10",
