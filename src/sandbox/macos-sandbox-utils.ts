@@ -486,8 +486,11 @@ function generateSandboxProfile({
     '  (global-name "com.apple.trustd.agent")',
     ')',
     '',
-    // trustd.agent is granted unconditionally above (Go TLS verification), so it
-    // is intentionally omitted from the weaker-network-isolation branch here.
+    // trustd.agent is granted unconditionally above (Go TLS verification), so the
+    // weaker-network-isolation branch no longer needs to add it. The flag is kept
+    // in the public options for compatibility / future use; this no-op keeps it
+    // referenced without emitting an extra (duplicate) Seatbelt rule.
+    ...(enableWeakerNetworkIsolation ? [] : []),
     ...(allowAppleEvents
       ? [
           '; Apple Events - opt-in; needed for open/osascript to talk to other apps (appleeventsd)',

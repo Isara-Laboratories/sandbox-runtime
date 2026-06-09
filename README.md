@@ -11,8 +11,35 @@ A lightweight sandboxing tool for enforcing filesystem and network restrictions 
 ## Installation
 
 ```bash
-npm install -g https://github.com/Isara-Laboratories/sandbox-runtime/releases/download/v0.0.49/anthropic-ai-sandbox-runtime-0.0.49.tgz
+npm install -g https://github.com/Isara-Laboratories/sandbox-runtime/releases/download/v0.0.54-isara.0/anthropic-ai-sandbox-runtime-0.0.54-isara.0.tgz
 ```
+
+## Isara fork
+
+> This repository is **[Isara-Laboratories/sandbox-runtime](https://github.com/Isara-Laboratories/sandbox-runtime)**, a fork of
+> [anthropic-experimental/sandbox-runtime](https://github.com/anthropic-experimental/sandbox-runtime).
+> It tracks upstream and carries a small set of Isara-specific changes on top.
+
+This release is synced with **upstream v0.0.54** (Windows sandbox support, the
+TLS-terminating MITM proxy, request filtering, etc.) and adds the fork-specific
+changes below. Version `0.0.54-isara.0` = "upstream 0.0.54 + Isara patch 0".
+
+### Fork modifications (vs. upstream)
+
+| # | Change | Where | Why |
+|---|--------|-------|-----|
+| 1 | **`allowAllDomains` network flag** — deny-list mode | `network` config | Allow all egress by default and block only `deniedDomains`; mirrors the filesystem "open by default, block explicitly" model. When set, the MITM proxy is skipped entirely so clients that bypass `HTTP_PROXY` and do direct DNS (e.g. urllib3-based SDKs) work — the OS sandbox still enforces everything else. |
+| 2 | **`allowGitConfig` also ungates `.gitconfig` and `.gitmodules`** | `filesystem` config | Lets sandboxed commands run `git config` and `git submodule add` while `.git/hooks` stays protected. Previously only `.git/config` was ungated. |
+| 3 | **`com.apple.trustd.agent` always allowed (macOS)** | Seatbelt profile | Go binaries (`gh`, `terraform`, …) need it for TLS certificate verification; without it any HTTPS connection fails with `OSStatus -26276`. Now granted unconditionally instead of only under weaker network isolation. |
+| 4 | **`SRT_DEBUG` filesystem-deny debug lines** | CLI / macOS log monitor | Setting `SRT_DEBUG=1` enables the macOS log monitor, which emits a `[SandboxDebug] fs_deny: …` line for every Seatbelt `file-*` denial — makes it obvious which path a sandbox blocked. |
+| 5 | **External-install friendliness** | `package.json`, `.gitignore`, `dist/` | `prepare` script is `husky \|\| true` (tolerates missing husky), `dist/` is committed and `npm install github:…`/tarball installs work without a build step. |
+
+> Change #6 (shell-quoting positional argv so metacharacters survive the internal
+> `bash -c` re-parse) was independently fixed upstream as well (#157) and is now
+> part of the merged baseline rather than a fork-only patch.
+
+See [Configuration Options](#configuration-options) for the `allowAllDomains` and
+`allowGitConfig` settings in context.
 
 ## Basic Usage
 
@@ -285,6 +312,7 @@ Uses an **allow-only pattern** - all network access is denied by default.
 
 - `network.allowedDomains` - Array of allowed domains (supports wildcards like `*.example.com`). Empty array = no network access.
 - `network.deniedDomains` - Array of denied domains (checked first, takes precedence over allowedDomains)
+- `network.allowAllDomains` - **(Isara fork)** Boolean, default `false`. When `true`, switches to **deny-list mode**: all egress is allowed by default and only `deniedDomains` are blocked. In this mode the MITM/filtering proxy is skipped entirely, so clients that bypass `HTTP_PROXY` and resolve DNS directly (e.g. urllib3-based SDKs) work correctly — the OS sandbox still enforces filesystem and the rest of the profile.
 - `network.allowLocalBinding` - Allow binding to local ports (boolean, default: false)
 
 **Unix Socket Settings** (platform-specific behavior):
@@ -347,7 +375,8 @@ Examples:
 
 - `ignoreViolations` - Object mapping command patterns to arrays of paths where violations should be ignored
 - `enableWeakerNestedSandbox` - Enable weaker sandbox mode for Docker environments (boolean, default: false)
-- `enableWeakerNetworkIsolation` - Allow access to `com.apple.trustd.agent` in the macOS sandbox (boolean, default: false). This is needed for Go programs (`gh`, `gcloud`, `terraform`, `kubectl`, etc.) to verify TLS certificates when using `httpProxyPort` with a MITM proxy and custom CA. **Security warning:** enabling this opens a potential data exfiltration vector through the trustd service.
+- `allowGitConfig` - Allow writes to git config files (boolean, default: false). When enabled, writes are permitted to `.git/config`, `.gitconfig`, and `.gitmodules` — e.g. for `git remote set-url`, `git config`, and `git submodule add` — while `.git/hooks` remains protected. **(Isara fork:** upstream gates only `.git/config`; this fork additionally ungates `.gitconfig` and `.gitmodules`.**)**
+- `enableWeakerNetworkIsolation` - Allow access to `com.apple.trustd.agent` in the macOS sandbox (boolean, default: false). This is needed for Go programs (`gh`, `gcloud`, `terraform`, `kubectl`, etc.) to verify TLS certificates when using `httpProxyPort` with a MITM proxy and custom CA. **Security warning:** enabling this opens a potential data exfiltration vector through the trustd service. **(Isara fork:** `com.apple.trustd.agent` is now granted **unconditionally**, so Go TLS verification works regardless of this flag; the flag is retained for compatibility.**)**
 - `allowAppleEvents` - Allow sending Apple Events and Launch Services open requests from the macOS sandbox (boolean, default: false). Without this, commands like `open`, `osascript`, and anything that opens URLs or scripts other apps via AppleScript fail with AppleScript error `-600` ("Application isn't running") or LaunchServices errors (`-10822`, `-54`). **Security warning:** enabling this means the sandbox no longer provides code-execution isolation. A sandboxed command can launch other applications via `open` with no user prompt, and anything it launches runs outside the sandbox's filesystem and network restrictions; scripting already-running apps via Apple Events is additionally gated by the user's per-app TCC automation consent. Embedders should only source this option from trusted user-level configuration — never from project-local files in a checked-out repository, which would let an attacker-authored project elevate its own sandbox permissions.
 
 ### Common Configuration Recipes
