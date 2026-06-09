@@ -4,6 +4,8 @@ import { request as httpsRequest } from 'node:https';
 import { connect } from 'node:net';
 import { URL } from 'node:url';
 import { logForDebugging } from '../utils/debug.js';
+import { decideAndRespond, } from './request-filter.js';
+import { peekForClientHello, terminateAndForward, } from './tls-terminate-proxy.js';
 import { connectViaParentProxy, dialDirect, openConnectTunnel, proxyAuthHeader, selectParentProxyUrl, shouldBypassParentProxy, stripBrackets, stripHopByHop, } from './parent-proxy.js';
 export function createHttpProxyServer(options) {
     const server = createServer();
@@ -40,7 +42,36 @@ export function createHttpProxyServer(options) {
                     'Connection blocked by network allowlist');
                 return;
             }
-            // Decide upstream route: MITM unix socket > parent HTTP proxy > direct.
+            // Decide upstream route:
+            //   in-process TLS termination
+            //   > external MITM unix socket
+            //   > parent HTTP proxy
+            //   > direct
+            // (tlsTerminate and mitmProxy are mutually exclusive at the config
+            // layer, so the first two never both apply.)
+            let wrote200 = false;
+            if (options.mitmCA) {
+                if (clientGone)
+                    return;
+                // We can only terminate TLS. CONNECT also carries non-TLS streams —
+                // notably SSH on Linux, where the sandbox's own GIT_SSH_COMMAND
+                // routes `ssh` through this proxy via `socat - PROXY:`. Send 200 so
+                // the client transmits its first bytes, sniff for a ClientHello, and
+                // only terminate if it is one. Non-TLS falls through to the opaque
+                // tunnel below — i.e. base-sandbox behaviour, hostname-allowlisted
+                // but not content-inspected (same as the SOCKS path).
+                socket.write('HTTP/1.1 200 Connection Established\r\n\r\n');
+                wrote200 = true;
+                const peeked = await peekForClientHello(socket, head);
+                if (clientGone)
+                    return;
+                if (peeked.isTLS) {
+                    terminateAndForward(options.mitmCA, options.filterRequest, socket, peeked.head, { hostname, port, upstreamCA: options.tlsTerminateUpstreamCA });
+                    return;
+                }
+                logForDebugging(`[tls-terminate] non-TLS bytes on CONNECT ${hostname}:${port}; opaque-tunnelling`);
+                head = peeked.head;
+            }
             const mitmSocketPath = options.getMitmSocketPath?.(hostname);
             const parentUrl = !mitmSocketPath &&
                 options.parentProxy &&
@@ -69,7 +100,12 @@ export function createHttpProxyServer(options) {
                 logForDebugging(`CONNECT tunnel failed: ${err.message}`, {
                     level: 'error',
                 });
-                socket.end('HTTP/1.1 502 Bad Gateway\r\n\r\n');
+                // If we already sent 200 (mitmCA sniff path), an HTTP status line now
+                // would land inside the tunnel as payload. Just close.
+                if (wrote200)
+                    socket.destroy();
+                else
+                    socket.end('HTTP/1.1 502 Bad Gateway\r\n\r\n');
                 return;
             }
             if (clientGone) {
@@ -77,9 +113,12 @@ export function createHttpProxyServer(options) {
                 upstream.destroy();
                 return;
             }
-            socket.write('HTTP/1.1 200 Connection Established\r\n\r\n');
+            if (!wrote200) {
+                socket.write('HTTP/1.1 200 Connection Established\r\n\r\n');
+            }
             // Forward any bytes the client sent in the same packet as the CONNECT
-            // (Node delivers these as the `head` buffer, not via the socket stream).
+            // (Node delivers these as the `head` buffer, not via the socket stream),
+            // plus anything the ClientHello sniff consumed when mitmCA is on.
             if (head.length)
                 upstream.write(head);
             upstream.pipe(socket);
@@ -139,6 +178,17 @@ export function createHttpProxyServer(options) {
             // sees exactly the host we allowlist-checked, closing URL-parser
             // differential bypasses.
             const absUrl = `${url.protocol}//${url.host}${url.pathname}${url.search}`;
+            // Per-request filter applies to plain HTTP too — otherwise a sandboxed
+            // client could bypass it by using http:// where the upstream serves it.
+            let body = req;
+            if (options.filterRequest) {
+                const ac = new AbortController();
+                res.once('close', () => ac.abort());
+                const out = await decideAndRespond(options.filterRequest, req, res, absUrl, ac.signal);
+                if (out === null)
+                    return;
+                body = out;
+            }
             let proxyReq;
             if (mitmSocketPath) {
                 logForDebugging(`Routing HTTP ${req.method} ${hostname}:${port} through MITM proxy at ${mitmSocketPath}`);
@@ -201,7 +251,7 @@ export function createHttpProxyServer(options) {
             });
             // Tear down the upstream request if the client goes away mid-flight.
             res.on('close', () => proxyReq.destroy());
-            req.pipe(proxyReq);
+            body.pipe(proxyReq);
         }
         catch (err) {
             logForDebugging(`Error handling HTTP request: ${err}`, { level: 'error' });

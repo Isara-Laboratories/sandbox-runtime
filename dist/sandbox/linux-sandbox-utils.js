@@ -7,7 +7,7 @@ import { spawn } from 'node:child_process';
 import { tmpdir } from 'node:os';
 import path, { join } from 'node:path';
 import { ripGrep } from '../utils/ripgrep.js';
-import { generateProxyEnvVars, normalizePathForSandbox, normalizeCaseForComparison, isSymlinkOutsideBoundary, DANGEROUS_FILES, getDangerousDirectories, } from './sandbox-utils.js';
+import { generateProxyEnvVars, normalizePathForSandbox, normalizeCaseForComparison, isSymlinkOutsideBoundary, getDangerousFiles, getDangerousDirectories, } from './sandbox-utils.js';
 import { getApplySeccompBinaryPath } from './generate-seccomp-filter.js';
 /** Default max depth for searching dangerous files */
 const DEFAULT_MANDATORY_DENY_SEARCH_DEPTH = 3;
@@ -105,10 +105,13 @@ async function linuxGetMandatoryDenyPaths(ripgrepConfig = { command: 'rg' }, max
     const fallbackController = new AbortController();
     const signal = abortSignal ?? fallbackController.signal;
     const dangerousDirectories = getDangerousDirectories();
+    // When allowGitConfig is true, drop .gitconfig and .gitmodules from the
+    // dangerous-file list (in addition to ungating .git/config below).
+    const dangerousFiles = getDangerousFiles(allowGitConfig);
     // Note: Settings files are added at the callsite in sandbox-manager.ts
     const denyPaths = [
         // Dangerous files in CWD
-        ...DANGEROUS_FILES.map(f => path.resolve(cwd, f)),
+        ...dangerousFiles.map(f => path.resolve(cwd, f)),
         // Dangerous directories in CWD
         ...dangerousDirectories.map(d => path.resolve(cwd, d)),
     ];
@@ -135,7 +138,7 @@ async function linuxGetMandatoryDenyPaths(ripgrepConfig = { command: 'rg' }, max
     }
     // Build iglob args for all patterns in one ripgrep call
     const iglobArgs = [];
-    for (const fileName of DANGEROUS_FILES) {
+    for (const fileName of dangerousFiles) {
         iglobArgs.push('--iglob', fileName);
     }
     for (const dirName of dangerousDirectories) {
@@ -282,15 +285,25 @@ export function cleanupBwrapMountPoints(opts) {
     }
     bwrapMountPoints.clear();
 }
+function isExecutable(p) {
+    try {
+        fs.accessSync(p, fs.constants.X_OK);
+        return true;
+    }
+    catch {
+        return false;
+    }
+}
 /**
  * Get detailed status of Linux sandbox dependencies
  */
-export function getLinuxDependencyStatus(seccompConfig) {
+export function getLinuxDependencyStatus(opts) {
+    const { seccompConfig, bwrapPath, socatPath } = opts ?? {};
     // argv0 mode: apply-seccomp is compiled into the caller's binary — skip
     // the on-disk lookup and trust that applyPath resolves inside bwrap.
     return {
-        hasBwrap: whichSync('bwrap') !== null,
-        hasSocat: whichSync('socat') !== null,
+        hasBwrap: bwrapPath ? isExecutable(bwrapPath) : whichSync('bwrap') !== null,
+        hasSocat: socatPath ? isExecutable(socatPath) : whichSync('socat') !== null,
         hasSeccompApply: seccompConfig?.argv0
             ? true
             : getApplySeccompBinaryPath(seccompConfig?.applyPath) !== null,
@@ -299,13 +312,26 @@ export function getLinuxDependencyStatus(seccompConfig) {
 /**
  * Check sandbox dependencies and return structured result
  */
-export function checkLinuxDependencies(seccompConfig) {
+export function checkLinuxDependencies(opts) {
+    const { seccompConfig, bwrapPath, socatPath } = opts ?? {};
     const errors = [];
     const warnings = [];
-    if (whichSync('bwrap') === null)
+    // An explicit override is a directive, not a hint — if it doesn't exist,
+    // surface that rather than silently falling back to PATH.
+    if (bwrapPath) {
+        if (!isExecutable(bwrapPath))
+            errors.push(`bubblewrap (bwrap) not executable at ${bwrapPath}`);
+    }
+    else if (whichSync('bwrap') === null) {
         errors.push('bubblewrap (bwrap) not installed');
-    if (whichSync('socat') === null)
+    }
+    if (socatPath) {
+        if (!isExecutable(socatPath))
+            errors.push(`socat not executable at ${socatPath}`);
+    }
+    else if (whichSync('socat') === null) {
         errors.push('socat not installed');
+    }
     if (!seccompConfig?.argv0 &&
         getApplySeccompBinaryPath(seccompConfig?.applyPath) === null) {
         warnings.push('seccomp not available - unix socket access not restricted');
@@ -338,7 +364,8 @@ export function checkLinuxDependencies(seccompConfig) {
  *
  * DEPENDENCIES: Requires bwrap (bubblewrap) and socat
  */
-export async function initializeLinuxNetworkBridge(httpProxyPort, socksProxyPort) {
+export async function initializeLinuxNetworkBridge(httpProxyPort, socksProxyPort, socatPath) {
+    const socat = socatPath ?? 'socat';
     const socketId = randomBytes(8).toString('hex');
     const httpSocketPath = join(tmpdir(), `claude-http-${socketId}.sock`);
     const socksSocketPath = join(tmpdir(), `claude-socks-${socketId}.sock`);
@@ -347,28 +374,41 @@ export async function initializeLinuxNetworkBridge(httpProxyPort, socksProxyPort
         `UNIX-LISTEN:${httpSocketPath},fork,reuseaddr`,
         `TCP:localhost:${httpProxyPort},keepalive,keepidle=10,keepintvl=5,keepcnt=3`,
     ];
-    logForDebugging(`Starting HTTP bridge: socat ${httpSocatArgs.join(' ')}`);
-    const httpBridgeProcess = spawn('socat', httpSocatArgs, {
+    logForDebugging(`Starting HTTP bridge: ${socat} ${httpSocatArgs.join(' ')}`);
+    const httpBridgeProcess = spawn(socat, httpSocatArgs, {
         stdio: 'ignore',
     });
-    if (!httpBridgeProcess.pid) {
-        throw new Error('Failed to start HTTP bridge process');
-    }
-    // Add error and exit handlers to monitor bridge health
+    // Add error and exit handlers to monitor bridge health. These must be
+    // registered before the !pid check: when spawn fails (e.g. socat is
+    // missing or not executable), the ChildProcess emits an asynchronous
+    // 'error' event, and throwing first would leave that event without a
+    // listener — surfacing as an uncaughtException instead of the rejection
+    // below.
     httpBridgeProcess.on('error', err => {
         logForDebugging(`HTTP bridge process error: ${err}`, { level: 'error' });
     });
     httpBridgeProcess.on('exit', (code, signal) => {
         logForDebugging(`HTTP bridge process exited with code ${code}, signal ${signal}`, { level: code === 0 ? 'info' : 'error' });
     });
+    if (!httpBridgeProcess.pid) {
+        throw new Error('Failed to start HTTP bridge process');
+    }
     // Start SOCKS bridge
     const socksSocatArgs = [
         `UNIX-LISTEN:${socksSocketPath},fork,reuseaddr`,
         `TCP:localhost:${socksProxyPort},keepalive,keepidle=10,keepintvl=5,keepcnt=3`,
     ];
-    logForDebugging(`Starting SOCKS bridge: socat ${socksSocatArgs.join(' ')}`);
-    const socksBridgeProcess = spawn('socat', socksSocatArgs, {
+    logForDebugging(`Starting SOCKS bridge: ${socat} ${socksSocatArgs.join(' ')}`);
+    const socksBridgeProcess = spawn(socat, socksSocatArgs, {
         stdio: 'ignore',
+    });
+    // Add error and exit handlers to monitor bridge health — registered
+    // before the !pid check for the same reason as the HTTP bridge above.
+    socksBridgeProcess.on('error', err => {
+        logForDebugging(`SOCKS bridge process error: ${err}`, { level: 'error' });
+    });
+    socksBridgeProcess.on('exit', (code, signal) => {
+        logForDebugging(`SOCKS bridge process exited with code ${code}, signal ${signal}`, { level: code === 0 ? 'info' : 'error' });
     });
     if (!socksBridgeProcess.pid) {
         // Clean up HTTP bridge
@@ -382,13 +422,6 @@ export async function initializeLinuxNetworkBridge(httpProxyPort, socksProxyPort
         }
         throw new Error('Failed to start SOCKS bridge process');
     }
-    // Add error and exit handlers to monitor bridge health
-    socksBridgeProcess.on('error', err => {
-        logForDebugging(`SOCKS bridge process error: ${err}`, { level: 'error' });
-    });
-    socksBridgeProcess.on('exit', (code, signal) => {
-        logForDebugging(`SOCKS bridge process exited with code ${code}, signal ${signal}`, { level: code === 0 ? 'info' : 'error' });
-    });
     // Wait for both sockets to be ready
     const maxAttempts = 5;
     for (let i = 0; i < maxAttempts; i++) {
@@ -466,12 +499,15 @@ function resolveApplySeccompPrefix(applyPath, argv0) {
  * Build the command that runs inside the sandbox.
  * Sets up HTTP proxy on port 3128 and SOCKS proxy on port 1080
  */
-function buildSandboxCommand(httpSocketPath, socksSocketPath, userCommand, applySeccompPrefix, shell) {
+function buildSandboxCommand(httpSocketPath, socksSocketPath, userCommand, applySeccompPrefix, shell, socatPath) {
     // Default to bash for backward compatibility
     const shellPath = shell || 'bash';
+    // Host filesystem is bind-mounted into the sandbox, so an explicit
+    // socatPath resolves to the same binary inside bwrap.
+    const socat = shellquote.quote([socatPath ?? 'socat']);
     const socatCommands = [
-        `socat TCP-LISTEN:3128,fork,reuseaddr UNIX-CONNECT:${httpSocketPath} >/dev/null 2>&1 &`,
-        `socat TCP-LISTEN:1080,fork,reuseaddr UNIX-CONNECT:${socksSocketPath} >/dev/null 2>&1 &`,
+        `${socat} TCP-LISTEN:3128,fork,reuseaddr UNIX-CONNECT:${httpSocketPath} >/dev/null 2>&1 &`,
+        `${socat} TCP-LISTEN:1080,fork,reuseaddr UNIX-CONNECT:${socksSocketPath} >/dev/null 2>&1 &`,
         'trap "kill %1 %2 2>/dev/null; exit" EXIT',
     ];
     // apply-seccomp runs after socat so socat can still create Unix sockets.
@@ -787,7 +823,7 @@ async function generateFilesystemArgs(readConfig, writeConfig, ripgrepConfig = {
  * Dependencies are checked by checkLinuxDependencies() before enabling the sandbox.
  */
 export async function wrapCommandWithSandboxLinux(params) {
-    const { command, needsNetworkRestriction, httpSocketPath, socksSocketPath, httpProxyPort, socksProxyPort, readConfig, writeConfig, enableWeakerNestedSandbox, allowAllUnixSockets, binShell, ripgrepConfig = { command: 'rg' }, mandatoryDenySearchDepth = DEFAULT_MANDATORY_DENY_SEARCH_DEPTH, allowGitConfig = false, seccompConfig, abortSignal, } = params;
+    const { command, needsNetworkRestriction, httpSocketPath, socksSocketPath, httpProxyPort, socksProxyPort, caCertPath, readConfig, writeConfig, enableWeakerNestedSandbox, allowAllUnixSockets, binShell, ripgrepConfig = { command: 'rg' }, mandatoryDenySearchDepth = DEFAULT_MANDATORY_DENY_SEARCH_DEPTH, allowGitConfig = false, seccompConfig, bwrapPath, socatPath, abortSignal, } = params;
     // Determine if we have restrictions to apply
     // Read: denyOnly pattern - empty array means no restrictions
     // Write: allowOnly pattern - undefined means no restrictions, any config means restrictions
@@ -850,7 +886,8 @@ export async function wrapCommandWithSandboxLinux(params) {
                 // HTTP_PROXY points to the socat listener inside the sandbox (port 3128)
                 // which forwards to the Unix socket that bridges to the host's proxy server
                 const proxyEnv = generateProxyEnvVars(3128, // Internal HTTP listener port
-                1080);
+                1080, // Internal SOCKS listener port
+                caCertPath);
                 bwrapArgs.push(...proxyEnv.flatMap((env) => {
                     const firstEq = env.indexOf('=');
                     const key = env.slice(0, firstEq);
@@ -914,7 +951,7 @@ export async function wrapCommandWithSandboxLinux(params) {
         // so socat starts before seccomp is applied. Otherwise invoke apply-seccomp
         // directly if we have a binary.
         if (needsNetworkRestriction && httpSocketPath && socksSocketPath) {
-            const sandboxCommand = buildSandboxCommand(httpSocketPath, socksSocketPath, command, applySeccompPrefix, shell);
+            const sandboxCommand = buildSandboxCommand(httpSocketPath, socksSocketPath, command, applySeccompPrefix, shell, socatPath);
             bwrapArgs.push(sandboxCommand);
         }
         else if (applySeccompPrefix) {
@@ -924,7 +961,10 @@ export async function wrapCommandWithSandboxLinux(params) {
         else {
             bwrapArgs.push(command);
         }
-        const wrappedCommand = shellquote.quote(['bwrap', ...bwrapArgs]);
+        const wrappedCommand = shellquote.quote([
+            bwrapPath ?? 'bwrap',
+            ...bwrapArgs,
+        ]);
         const restrictions = [];
         if (needsNetworkRestriction)
             restrictions.push('network');
