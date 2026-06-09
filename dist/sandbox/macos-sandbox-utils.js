@@ -3,7 +3,7 @@ import { spawn } from 'child_process';
 import * as path from 'path';
 import { logForDebugging } from '../utils/debug.js';
 import { whichSync } from '../utils/which.js';
-import { normalizePathForSandbox, generateProxyEnvVars, encodeSandboxedCommand, decodeSandboxedCommand, containsGlobChars, globToRegex, DANGEROUS_FILES, getDangerousDirectories, } from './sandbox-utils.js';
+import { normalizePathForSandbox, generateProxyEnvVars, encodeSandboxedCommand, decodeSandboxedCommand, containsGlobChars, globToRegex, getDangerousFiles, getDangerousDirectories, } from './sandbox-utils.js';
 /**
  * Get mandatory deny patterns as glob patterns (no filesystem scanning).
  * macOS sandbox profile supports regex/glob matching directly via globToRegex().
@@ -11,8 +11,10 @@ import { normalizePathForSandbox, generateProxyEnvVars, encodeSandboxedCommand, 
 export function macGetMandatoryDenyPatterns(allowGitConfig = false) {
     const cwd = process.cwd();
     const denyPaths = [];
-    // Dangerous files - static paths in CWD + glob patterns for subtree
-    for (const fileName of DANGEROUS_FILES) {
+    // Dangerous files - static paths in CWD + glob patterns for subtree.
+    // When allowGitConfig is true, .gitconfig and .gitmodules are dropped so
+    // callers can edit them (e.g. `git submodule add`, `git config`).
+    for (const fileName of getDangerousFiles(allowGitConfig)) {
         denyPaths.push(path.resolve(cwd, fileName));
         denyPaths.push(`**/${fileName}`);
     }
@@ -60,8 +62,11 @@ function getAncestorDirectories(pathStr) {
     return ancestors;
 }
 /**
- * Generate deny rules for file movement (file-write-unlink) to protect paths
- * This prevents bypassing read or write restrictions by moving files/directories
+ * Generate deny rules for file movement (file-write-unlink) and creation
+ * (file-write-create) to protect paths. This prevents bypassing read or write
+ * restrictions by moving files/directories, and prevents replacing a
+ * not-yet-existing protected path (or one of its ancestors) with an
+ * attacker-controlled symlink.
  *
  * @param pathPatterns - Array of path patterns to protect (can include globs)
  * @param logTag - Log tag for sandbox violations
@@ -69,13 +74,16 @@ function getAncestorDirectories(pathStr) {
  */
 function generateMoveBlockingRules(pathPatterns, logTag) {
     const rules = [];
+    const ops = ['file-write-unlink', 'file-write-create'];
     for (const pathPattern of pathPatterns) {
         const normalizedPath = normalizePathForSandbox(pathPattern);
         if (containsGlobChars(normalizedPath)) {
             // Use regex matching for glob patterns
             const regexPattern = globToRegex(normalizedPath);
             // Block moving/renaming files matching this pattern
-            rules.push(`(deny file-write-unlink`, `  (regex ${escapePath(regexPattern)})`, `  (with message "${logTag}"))`);
+            for (const op of ops) {
+                rules.push(`(deny ${op}`, `  (regex ${escapePath(regexPattern)})`, `  (with message "${logTag}"))`);
+            }
             // For glob patterns, extract the static prefix and block ancestor moves
             // Remove glob characters to get the directory prefix
             const staticPrefix = normalizedPath.split(/[*?[\]]/)[0];
@@ -85,20 +93,28 @@ function generateMoveBlockingRules(pathPatterns, logTag) {
                     ? staticPrefix.slice(0, -1)
                     : path.dirname(staticPrefix);
                 // Block moves of the base directory itself
-                rules.push(`(deny file-write-unlink`, `  (literal ${escapePath(baseDir)})`, `  (with message "${logTag}"))`);
+                for (const op of ops) {
+                    rules.push(`(deny ${op}`, `  (literal ${escapePath(baseDir)})`, `  (with message "${logTag}"))`);
+                }
                 // Block moves of ancestor directories
                 for (const ancestorDir of getAncestorDirectories(baseDir)) {
-                    rules.push(`(deny file-write-unlink`, `  (literal ${escapePath(ancestorDir)})`, `  (with message "${logTag}"))`);
+                    for (const op of ops) {
+                        rules.push(`(deny ${op}`, `  (literal ${escapePath(ancestorDir)})`, `  (with message "${logTag}"))`);
+                    }
                 }
             }
         }
         else {
             // Use subpath matching for literal paths
             // Block moving/renaming the denied path itself
-            rules.push(`(deny file-write-unlink`, `  (subpath ${escapePath(normalizedPath)})`, `  (with message "${logTag}"))`);
+            for (const op of ops) {
+                rules.push(`(deny ${op}`, `  (subpath ${escapePath(normalizedPath)})`, `  (with message "${logTag}"))`);
+            }
             // Block moves of ancestor directories
             for (const ancestorDir of getAncestorDirectories(normalizedPath)) {
-                rules.push(`(deny file-write-unlink`, `  (literal ${escapePath(ancestorDir)})`, `  (with message "${logTag}"))`);
+                for (const op of ops) {
+                    rules.push(`(deny ${op}`, `  (literal ${escapePath(ancestorDir)})`, `  (with message "${logTag}"))`);
+                }
             }
         }
     }
@@ -168,14 +184,15 @@ function generateReadRules(config, logTag, writeAllowPaths) {
     }
     // Block file movement to prevent bypass via mv/rename
     rules.push(...generateMoveBlockingRules(config.denyOnly || [], logTag));
-    // Re-allow file-write-unlink for paths that are explicitly write-allowed.
-    // The move-blocking rules above emit broad (deny file-write-unlink (subpath "/Users"))
-    // to prevent bypassing read restrictions by moving files out of denied regions.
+    // Re-allow file-write-unlink / file-write-create for paths that are explicitly
+    // write-allowed. The move-blocking rules above emit broad
+    // (deny file-write-unlink (subpath "/Users")) to prevent bypassing read
+    // restrictions by moving files out of denied regions.
     // However, in macOS Seatbelt, a specific (deny file-write-unlink) is not overridden
     // by a later (allow file-write*) wildcard — the specific operation deny wins.
     // This means file deletions are blocked even in write-allowed directories like
     // the project directory. We fix this by explicitly re-allowing file-write-unlink
-    // for write-allowed paths after the move-blocking deny rules.
+    // and file-write-create for write-allowed paths after the move-blocking deny rules.
     //
     // Note: denyWithinAllow paths are not excluded here because the write section's
     // generateMoveBlockingRules() runs later in the profile and re-denies
@@ -184,12 +201,14 @@ function generateReadRules(config, logTag, writeAllowPaths) {
     if (writeAllowPaths && writeAllowPaths.length > 0) {
         for (const pathPattern of writeAllowPaths) {
             const normalizedPath = normalizePathForSandbox(pathPattern);
-            if (containsGlobChars(normalizedPath)) {
-                const regexPattern = globToRegex(normalizedPath);
-                rules.push(`(allow file-write-unlink`, `  (regex ${escapePath(regexPattern)})`, `  (with message "${logTag}"))`);
-            }
-            else {
-                rules.push(`(allow file-write-unlink`, `  (subpath ${escapePath(normalizedPath)})`, `  (with message "${logTag}"))`);
+            for (const op of ['file-write-unlink', 'file-write-create']) {
+                if (containsGlobChars(normalizedPath)) {
+                    const regexPattern = globToRegex(normalizedPath);
+                    rules.push(`(allow ${op}`, `  (regex ${escapePath(regexPattern)})`, `  (with message "${logTag}"))`);
+                }
+                else {
+                    rules.push(`(allow ${op}`, `  (subpath ${escapePath(normalizedPath)})`, `  (with message "${logTag}"))`);
+                }
             }
         }
     }
@@ -240,7 +259,7 @@ function generateWriteRules(config, logTag, allowGitConfig = false) {
 /**
  * Generate complete sandbox profile
  */
-function generateSandboxProfile({ readConfig, writeConfig, httpProxyPort, socksProxyPort, needsNetworkRestriction, allowUnixSockets, allowAllUnixSockets, allowLocalBinding, allowMachLookup, allowPty, allowGitConfig = false, enableWeakerNetworkIsolation = false, logTag, }) {
+function generateSandboxProfile({ readConfig, writeConfig, httpProxyPort, socksProxyPort, needsNetworkRestriction, allowUnixSockets, allowAllUnixSockets, allowLocalBinding, allowMachLookup, allowPty, allowGitConfig = false, enableWeakerNetworkIsolation = false, allowAppleEvents = false, logTag, }) {
     const profile = [
         '(version 1)',
         `(deny default (with message "${logTag}"))`,
@@ -281,7 +300,24 @@ function generateSandboxProfile({ readConfig, writeConfig, httpProxyPort, socksP
         '  (global-name "com.apple.trustd.agent")',
         ')',
         '',
+        // trustd.agent is granted unconditionally above (Go TLS verification), so the
+        // weaker-network-isolation branch no longer needs to add it. The flag is kept
+        // in the public options for compatibility / future use; this no-op keeps it
+        // referenced without emitting an extra (duplicate) Seatbelt rule.
         ...(enableWeakerNetworkIsolation ? [] : []),
+        ...(allowAppleEvents
+            ? [
+                '; Apple Events - opt-in; needed for open/osascript to talk to other apps (appleeventsd)',
+                '(allow appleevent-send)',
+                '(allow mach-lookup (global-name "com.apple.coreservices.appleevents"))',
+                '; Launch Services open requests need the lsopen operation plus, on',
+                '; macOS 14/15, coreservicesd and the quarantine resolver - without',
+                '; these open fails with -10822 kLSServerCommunicationErr or -54',
+                '(allow lsopen)',
+                '(allow mach-lookup (global-name "com.apple.CoreServices.coreservicesd"))',
+                '(allow mach-lookup (global-name "com.apple.coreservices.quarantine-resolver"))',
+            ]
+            : []),
         ...(allowMachLookup && allowMachLookup.length > 0
             ? [
                 '; User-specified XPC/Mach services',
@@ -492,7 +528,7 @@ function escapePath(pathStr) {
  * Wrap command with macOS sandbox
  */
 export function wrapCommandWithSandboxMacOS(params) {
-    const { command, needsNetworkRestriction, httpProxyPort, socksProxyPort, allowUnixSockets, allowAllUnixSockets, allowLocalBinding, allowMachLookup, readConfig, writeConfig, allowPty, allowGitConfig = false, enableWeakerNetworkIsolation = false, binShell, } = params;
+    const { command, needsNetworkRestriction, httpProxyPort, socksProxyPort, caCertPath, allowUnixSockets, allowAllUnixSockets, allowLocalBinding, allowMachLookup, readConfig, writeConfig, allowPty, allowGitConfig = false, enableWeakerNetworkIsolation = false, allowAppleEvents = false, binShell, } = params;
     // Determine if we have restrictions to apply
     // Read: denyOnly pattern - empty array means no restrictions
     // Write: allowOnly pattern - undefined means no restrictions, any config means restrictions
@@ -518,10 +554,11 @@ export function wrapCommandWithSandboxMacOS(params) {
         allowPty,
         allowGitConfig,
         enableWeakerNetworkIsolation,
+        allowAppleEvents,
         logTag,
     });
     // Generate proxy environment variables using shared utility
-    const proxyEnvArgs = generateProxyEnvVars(httpProxyPort, socksProxyPort);
+    const proxyEnvArgs = generateProxyEnvVars(httpProxyPort, socksProxyPort, caCertPath);
     // Use the user's shell (zsh, bash, etc.) to ensure aliases/snapshots work
     // Resolve the full path to the shell binary
     const shellName = binShell || 'bash';
@@ -534,7 +571,7 @@ export function wrapCommandWithSandboxMacOS(params) {
     const wrappedCommand = shellquote.quote([
         'env',
         ...proxyEnvArgs,
-        'sandbox-exec',
+        '/usr/bin/sandbox-exec',
         '-p',
         profile,
         shell,

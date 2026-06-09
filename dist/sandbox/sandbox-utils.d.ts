@@ -2,32 +2,24 @@
  * Dangerous files that should be protected from writes.
  * These files can be used for code execution or data exfiltration.
  */
-export declare const DANGEROUS_FILES: readonly [
-  '.gitconfig',
-  '.gitmodules',
-  '.bashrc',
-  '.bash_profile',
-  '.zshrc',
-  '.zprofile',
-  '.profile',
-  '.ripgreprc',
-  '.mcp.json',
-]
+export declare const DANGEROUS_FILES: readonly [".gitconfig", ".gitmodules", ".bashrc", ".bash_profile", ".zshrc", ".zprofile", ".profile", ".ripgreprc", ".mcp.json"];
 /**
  * Dangerous directories that should be protected from writes.
  * These directories contain sensitive configuration or executable files.
  */
-export declare const DANGEROUS_DIRECTORIES: readonly [
-  '.git',
-  '.vscode',
-  '.idea',
-]
+export declare const DANGEROUS_DIRECTORIES: readonly [".git", ".vscode", ".idea"];
 /**
  * Get the list of dangerous directories to deny writes to.
  * Excludes .git since we need it writable for git operations -
  * instead we block specific paths within .git (hooks and config).
  */
-export declare function getDangerousDirectories(): string[]
+export declare function getDangerousDirectories(): string[];
+/**
+ * Get the list of dangerous filenames to deny writes to.
+ * When `allowGitConfig` is true, `.gitconfig` and `.gitmodules` are excluded
+ * so callers can run `git submodule add`, `git config`, etc.
+ */
+export declare function getDangerousFiles(allowGitConfig?: boolean): readonly string[];
 /**
  * Normalizes a path for case-insensitive comparison.
  * This prevents bypassing security checks using mixed-case paths on case-insensitive
@@ -37,16 +29,16 @@ export declare function getDangerousDirectories(): string[]
  * @param path The path to normalize
  * @returns The lowercase path for safe comparison
  */
-export declare function normalizeCaseForComparison(pathStr: string): string
+export declare function normalizeCaseForComparison(pathStr: string): string;
 /**
  * Check if a path pattern contains glob characters
  */
-export declare function containsGlobChars(pathPattern: string): boolean
+export declare function containsGlobChars(pathPattern: string): boolean;
 /**
  * Remove trailing /** glob suffix from a path pattern
  * Used to normalize path patterns since /** just means "directory and everything under it"
  */
-export declare function removeTrailingGlobSuffix(pathPattern: string): string
+export declare function removeTrailingGlobSuffix(pathPattern: string): string;
 /**
  * Check if a symlink resolution crosses expected path boundaries.
  *
@@ -60,10 +52,7 @@ export declare function removeTrailingGlobSuffix(pathPattern: string): string
  * @param resolvedPath - The path after fs.realpathSync() resolution
  * @returns true if the resolved path is outside expected boundaries
  */
-export declare function isSymlinkOutsideBoundary(
-  originalPath: string,
-  resolvedPath: string,
-): boolean
+export declare function isSymlinkOutsideBoundary(originalPath: string, resolvedPath: string): boolean;
 /**
  * Normalize a path for use in sandbox configurations
  * Handles:
@@ -75,7 +64,7 @@ export declare function isSymlinkOutsideBoundary(
  *
  * Returns the absolute path with symlinks resolved (or normalized glob pattern)
  */
-export declare function normalizePathForSandbox(pathPattern: string): string
+export declare function normalizePathForSandbox(pathPattern: string): string;
 /**
  * Get recommended system paths that should be writable for commands to work properly
  *
@@ -83,23 +72,25 @@ export declare function normalizePathForSandbox(pathPattern: string): string
  * allow access to files from other processes. In highly security-sensitive
  * environments, you should configure more restrictive write paths.
  */
-export declare function getDefaultWritePaths(): string[]
+export declare function getDefaultWritePaths(): string[];
 /**
  * Generate proxy environment variables for sandboxed processes
  */
-export declare function generateProxyEnvVars(
-  httpProxyPort?: number,
-  socksProxyPort?: number,
-): string[]
+/**
+ * Per-tool trust-store env vars set to the TLS-termination CA cert path so
+ * HTTPS clients in the sandboxed child accept proxy-minted certs.
+ */
+export declare const CA_TRUST_VARS: readonly ["NODE_EXTRA_CA_CERTS", "SSL_CERT_FILE", "CURL_CA_BUNDLE", "REQUESTS_CA_BUNDLE", "PIP_CERT", "GIT_SSL_CAINFO", "AWS_CA_BUNDLE", "CARGO_HTTP_CAINFO", "DENO_CERT"];
+export declare function generateProxyEnvVars(httpProxyPort?: number, socksProxyPort?: number, caCertPath?: string): string[];
 /**
  * Encode a command for sandbox monitoring
  * Truncates to 100 chars and base64 encodes to avoid parsing issues
  */
-export declare function encodeSandboxedCommand(command: string): string
+export declare function encodeSandboxedCommand(command: string): string;
 /**
  * Decode a base64-encoded command from sandbox monitoring
  */
-export declare function decodeSandboxedCommand(encodedCommand: string): string
+export declare function decodeSandboxedCommand(encodedCommand: string): string;
 /**
  * Convert a glob pattern to a regular expression
  *
@@ -114,7 +105,7 @@ export declare function decodeSandboxedCommand(encodedCommand: string): string
  *
  * Exported for testing and shared between macOS sandbox profiles and Linux glob expansion.
  */
-export declare function globToRegex(globPattern: string): string
+export declare function globToRegex(globPattern: string): string;
 /**
  * Expand a glob pattern into concrete file paths.
  *
@@ -125,5 +116,5 @@ export declare function globToRegex(globPattern: string): string
  * @param globPath - A path pattern containing glob characters (e.g., ~/test/*.env)
  * @returns Array of absolute paths matching the glob pattern
  */
-export declare function expandGlobPattern(globPath: string): string[]
+export declare function expandGlobPattern(globPath: string): string[];
 //# sourceMappingURL=sandbox-utils.d.ts.map

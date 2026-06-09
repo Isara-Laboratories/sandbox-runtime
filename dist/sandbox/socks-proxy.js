@@ -80,15 +80,27 @@ export function createSocksProxyServer(options) {
             }
         });
     });
+    // Track every accepted client socket so close() can tear them down
+    // immediately. `net.Server.close()`'s callback waits for all open
+    // connections to finish, and a SOCKS connection mid-`dialDirect()` (30s
+    // timeout) or mid-relay holds the server open indefinitely. During
+    // SandboxManager.reset() that turns into a hang that can outlive bun's
+    // 5s test/hook timeout, so we destroy connections rather than drain them.
+    const internalServer = socksServer
+        ?.server;
+    const openSockets = new Set();
+    internalServer?.on('connection', (socket) => {
+        openSockets.add(socket);
+        socket.once('close', () => openSockets.delete(socket));
+    });
     return {
         server: socksServer,
         getPort() {
             // Access the internal server to get the port
             // We need to use type assertion here as the server property is private
             try {
-                const serverInternal = socksServer?.server;
-                if (serverInternal && typeof serverInternal?.address === 'function') {
-                    const address = serverInternal.address();
+                if (internalServer && typeof internalServer?.address === 'function') {
+                    const address = internalServer.address();
                     if (address && typeof address === 'object' && 'port' in address) {
                         return address.port;
                     }
@@ -102,10 +114,9 @@ export function createSocksProxyServer(options) {
         },
         listen(port, hostname) {
             return new Promise((resolve, reject) => {
-                const serverInternal = socksServer?.server;
-                serverInternal?.once('error', reject);
+                internalServer?.once('error', reject);
                 const listeningCallback = () => {
-                    serverInternal?.removeListener('error', reject);
+                    internalServer?.removeListener('error', reject);
                     const actualPort = this.getPort();
                     if (actualPort) {
                         logForDebugging(`SOCKS proxy listening on ${hostname}:${actualPort}`);
@@ -135,14 +146,20 @@ export function createSocksProxyServer(options) {
                     }
                     resolve();
                 });
+                // Forcibly drop any sockets still open. close() above stopped the
+                // listener; the callback won't fire until these drain on their own,
+                // and a stuck upstream dial means they may never drain.
+                for (const socket of openSockets) {
+                    socket.destroy();
+                }
+                openSockets.clear();
             });
         },
         unref() {
             // Access the internal server to call unref
             try {
-                const serverInternal = socksServer?.server;
-                if (serverInternal && typeof serverInternal?.unref === 'function') {
-                    serverInternal.unref();
+                if (internalServer && typeof internalServer?.unref === 'function') {
+                    internalServer.unref();
                 }
             }
             catch (error) {

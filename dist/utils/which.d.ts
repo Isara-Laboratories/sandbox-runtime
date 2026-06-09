@@ -5,5 +5,5 @@
  * @param bin - The name of the executable to find
  * @returns The full path to the executable, or null if not found
  */
-export declare function whichSync(bin: string): string | null
+export declare function whichSync(bin: string): string | null;
 //# sourceMappingURL=which.d.ts.map

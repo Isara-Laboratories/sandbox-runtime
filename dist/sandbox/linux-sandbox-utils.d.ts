@@ -1,41 +1,44 @@
-import type { ChildProcess } from 'node:child_process'
-import type {
-  FsReadRestrictionConfig,
-  FsWriteRestrictionConfig,
-} from './sandbox-schemas.js'
-import type { SeccompConfig } from './sandbox-config.js'
+import type { ChildProcess } from 'node:child_process';
+import type { FsReadRestrictionConfig, FsWriteRestrictionConfig } from './sandbox-schemas.js';
+import type { SeccompConfig } from './sandbox-config.js';
 export interface LinuxNetworkBridgeContext {
-  httpSocketPath: string
-  socksSocketPath: string
-  httpBridgeProcess: ChildProcess
-  socksBridgeProcess: ChildProcess
-  httpProxyPort: number
-  socksProxyPort: number
+    httpSocketPath: string;
+    socksSocketPath: string;
+    httpBridgeProcess: ChildProcess;
+    socksBridgeProcess: ChildProcess;
+    httpProxyPort: number;
+    socksProxyPort: number;
 }
 export interface LinuxSandboxParams {
-  command: string
-  needsNetworkRestriction: boolean
-  httpSocketPath?: string
-  socksSocketPath?: string
-  httpProxyPort?: number
-  socksProxyPort?: number
-  readConfig?: FsReadRestrictionConfig
-  writeConfig?: FsWriteRestrictionConfig
-  enableWeakerNestedSandbox?: boolean
-  allowAllUnixSockets?: boolean
-  binShell?: string
-  ripgrepConfig?: {
-    command: string
-    args?: string[]
-  }
-  /** Maximum directory depth to search for dangerous files (default: 3) */
-  mandatoryDenySearchDepth?: number
-  /** Allow writes to .git/config files (default: false) */
-  allowGitConfig?: boolean
-  /** Custom seccomp binary paths */
-  seccompConfig?: SeccompConfig
-  /** Abort signal to cancel the ripgrep scan */
-  abortSignal?: AbortSignal
+    command: string;
+    needsNetworkRestriction: boolean;
+    httpSocketPath?: string;
+    socksSocketPath?: string;
+    httpProxyPort?: number;
+    socksProxyPort?: number;
+    /** Path to the TLS-termination CA cert; injected as trust env vars. */
+    caCertPath?: string;
+    readConfig?: FsReadRestrictionConfig;
+    writeConfig?: FsWriteRestrictionConfig;
+    enableWeakerNestedSandbox?: boolean;
+    allowAllUnixSockets?: boolean;
+    binShell?: string;
+    ripgrepConfig?: {
+        command: string;
+        args?: string[];
+    };
+    /** Maximum directory depth to search for dangerous files (default: 3) */
+    mandatoryDenySearchDepth?: number;
+    /** Allow writes to .git/config files (default: false) */
+    allowGitConfig?: boolean;
+    /** Custom seccomp binary paths */
+    seccompConfig?: SeccompConfig;
+    /** Absolute path to the bwrap binary (default: resolve "bwrap" via PATH) */
+    bwrapPath?: string;
+    /** Absolute path to the socat binary (default: resolve "socat" via PATH) */
+    socatPath?: string;
+    /** Abort signal to cancel the ripgrep scan */
+    abortSignal?: AbortSignal;
 }
 /**
  * Clean up mount point files created by bwrap for non-existent deny paths.
@@ -59,35 +62,40 @@ export interface LinuxSandboxParams {
  * handler and reset() where deferral is not meaningful.
  */
 export declare function cleanupBwrapMountPoints(opts?: {
-  force?: boolean
-}): void
+    force?: boolean;
+}): void;
 /**
  * Detailed status of Linux sandbox dependencies
  */
 export type LinuxDependencyStatus = {
-  hasBwrap: boolean
-  hasSocat: boolean
-  hasSeccompApply: boolean
-}
+    hasBwrap: boolean;
+    hasSocat: boolean;
+    hasSeccompApply: boolean;
+};
 /**
  * Result of checking sandbox dependencies
  */
 export type SandboxDependencyCheck = {
-  warnings: string[]
-  errors: string[]
-}
+    warnings: string[];
+    errors: string[];
+};
+/**
+ * Options for Linux dependency checks. Explicit binary paths, when set,
+ * are checked directly instead of resolving via PATH.
+ */
+export type LinuxDependencyOptions = {
+    seccompConfig?: SeccompConfig;
+    bwrapPath?: string;
+    socatPath?: string;
+};
 /**
  * Get detailed status of Linux sandbox dependencies
  */
-export declare function getLinuxDependencyStatus(
-  seccompConfig?: SeccompConfig,
-): LinuxDependencyStatus
+export declare function getLinuxDependencyStatus(opts?: LinuxDependencyOptions): LinuxDependencyStatus;
 /**
  * Check sandbox dependencies and return structured result
  */
-export declare function checkLinuxDependencies(
-  seccompConfig?: SeccompConfig,
-): SandboxDependencyCheck
+export declare function checkLinuxDependencies(opts?: LinuxDependencyOptions): SandboxDependencyCheck;
 /**
  * Initialize the Linux network bridge for sandbox networking
  *
@@ -114,10 +122,7 @@ export declare function checkLinuxDependencies(
  *
  * DEPENDENCIES: Requires bwrap (bubblewrap) and socat
  */
-export declare function initializeLinuxNetworkBridge(
-  httpProxyPort: number,
-  socksProxyPort: number,
-): Promise<LinuxNetworkBridgeContext>
+export declare function initializeLinuxNetworkBridge(httpProxyPort: number, socksProxyPort: number, socatPath?: string): Promise<LinuxNetworkBridgeContext>;
 /**
  * Wrap a command with sandbox restrictions on Linux
  *
@@ -166,7 +171,5 @@ export declare function initializeLinuxNetworkBridge(
  *   set allowAllUnixSockets: true in your configuration
  * Dependencies are checked by checkLinuxDependencies() before enabling the sandbox.
  */
-export declare function wrapCommandWithSandboxLinux(
-  params: LinuxSandboxParams,
-): Promise<string>
+export declare function wrapCommandWithSandboxLinux(params: LinuxSandboxParams): Promise<string>;
 //# sourceMappingURL=linux-sandbox-utils.d.ts.map

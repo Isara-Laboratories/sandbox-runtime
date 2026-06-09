@@ -14,20 +14,20 @@
  *     only; the port is ignored.
  *   - a generic CONNECT-tunnel helper that works over Unix socket, TCP, or TLS
  */
-import type { Socket } from 'node:net'
-import type { IncomingHttpHeaders } from 'node:http'
-import { BlockList } from 'node:net'
-import { URL } from 'node:url'
-import type { ParentProxyConfig } from './sandbox-config.js'
+import type { Socket } from 'node:net';
+import type { IncomingHttpHeaders } from 'node:http';
+import { BlockList } from 'node:net';
+import { URL } from 'node:url';
+import type { ParentProxyConfig } from './sandbox-config.js';
 export interface ResolvedParentProxy {
-  httpUrl?: URL
-  httpsUrl?: URL
-  noProxy: NoProxyRules
+    httpUrl?: URL;
+    httpsUrl?: URL;
+    noProxy: NoProxyRules;
 }
 interface NoProxyRules {
-  all: boolean
-  suffixes: string[]
-  cidr: BlockList
+    all: boolean;
+    suffixes: string[];
+    cidr: BlockList;
 }
 /**
  * Resolve the parent proxy config, falling back to the SRT process's own
@@ -35,9 +35,7 @@ interface NoProxyRules {
  * child's* environment to point at itself — but process.env here reflects the
  * environment SRT itself was launched with, which is what we want.
  */
-export declare function resolveParentProxy(
-  cfg?: ParentProxyConfig,
-): ResolvedParentProxy | undefined
+export declare function resolveParentProxy(cfg?: ParentProxyConfig): ResolvedParentProxy | undefined;
 /**
  * Returns true if the given host should bypass the parent proxy and connect
  * directly. Always bypasses loopback.
@@ -45,60 +43,46 @@ export declare function resolveParentProxy(
  * NB: the port is not consulted. NO_PROXY entries of the form `host:port` are
  * matched by host only (the port suffix is stripped during parsing).
  */
-export declare function shouldBypassParentProxy(
-  resolved: ResolvedParentProxy,
-  host: string,
-): boolean
+export declare function shouldBypassParentProxy(resolved: ResolvedParentProxy, host: string): boolean;
 /**
  * Pick which parent proxy URL to use for a given destination.
  */
-export declare function selectParentProxyUrl(
-  resolved: ResolvedParentProxy,
-  opts: {
-    isHttps: boolean
-  },
-): URL | undefined
+export declare function selectParentProxyUrl(resolved: ResolvedParentProxy, opts: {
+    isHttps: boolean;
+}): URL | undefined;
 export interface ConnectTunnelOptions {
-  /** Establish the transport to the proxy. */
-  dial(): Socket
-  /** Fired when the transport is ready to write (e.g. 'connect'/'secureConnect'). */
-  readyEvent: 'connect' | 'secureConnect'
-  destHost: string
-  destPort: number
-  authHeader?: string
-  timeoutMs?: number
+    /** Establish the transport to the proxy. */
+    dial(): Socket;
+    /** Fired when the transport is ready to write (e.g. 'connect'/'secureConnect'). */
+    readyEvent: 'connect' | 'secureConnect';
+    destHost: string;
+    destPort: number;
+    authHeader?: string;
+    timeoutMs?: number;
 }
 /**
  * Generic CONNECT-tunnel: dial a proxy transport (unix/tcp/tls), send
  * `CONNECT host:port`, wait for a 2xx, and resolve with the tunnelled socket.
  * Validates destHost to prevent CRLF injection from untrusted callers.
  */
-export declare function openConnectTunnel(
-  opts: ConnectTunnelOptions,
-): Promise<Socket>
+export declare function openConnectTunnel(opts: ConnectTunnelOptions): Promise<Socket>;
 /**
  * Open a CONNECT tunnel through a parent HTTP(S) proxy specified by URL.
  * Thin wrapper around openConnectTunnel that dials TCP or TLS based on the
  * proxy URL scheme.
  */
-export declare function connectViaParentProxy(
-  proxyUrl: URL,
-  destHost: string,
-  destPort: number,
-): Promise<Socket>
-export declare function proxyAuthHeader(proxyUrl: URL): string | undefined
+export declare function connectViaParentProxy(proxyUrl: URL, destHost: string, destPort: number): Promise<Socket>;
+export declare function proxyAuthHeader(proxyUrl: URL): string | undefined;
 /**
  * Strip hop-by-hop and proxy-specific headers before forwarding upstream.
  * Also strips any headers named in the incoming `Connection` header, per
  * RFC 7230 §6.1.
  */
-export declare function stripHopByHop(
-  h: IncomingHttpHeaders,
-): IncomingHttpHeaders
+export declare function stripHopByHop(h: IncomingHttpHeaders): IncomingHttpHeaders;
 /** Remove surrounding square brackets from an IPv6 literal. */
-export declare function stripBrackets(host: string): string
+export declare function stripBrackets(host: string): string;
 /** Redact userinfo from a URL for safe logging. */
-export declare function redactUrl(u: URL | undefined): string
+export declare function redactUrl(u: URL | undefined): string;
 /**
  * Hostname validation: accepts DNS names and IP literals (without zone IDs).
  * Primary purpose is to block control characters (CRLF injection, null-byte
@@ -110,7 +94,7 @@ export declare function redactUrl(u: URL | undefined): string
  * would pass `isIP`, pass a `.endsWith('.allowed.com')` wildcard check, and
  * then connect to 1.2.3.4 when the OS discards the bogus scope.
  */
-export declare function isValidHost(h: string): boolean
+export declare function isValidHost(h: string): boolean;
 /**
  * Canonicalize a host string via the WHATWG URL parser so that string
  * comparisons in the allowlist agree with what `net.connect()`/`getaddrinfo()`
@@ -122,16 +106,12 @@ export declare function isValidHost(h: string): boolean
  *
  * Returns undefined if the input is not a valid URL host.
  */
-export declare function canonicalizeHost(h: string): string | undefined
+export declare function canonicalizeHost(h: string): string | undefined;
 /**
  * Dial `host:port` directly with a bounded timeout. Shared by the HTTP and
  * SOCKS direct-connect paths so they get the same timeout behaviour as the
  * CONNECT-tunnelled paths.
  */
-export declare function dialDirect(
-  host: string,
-  port: number,
-  timeoutMs?: number,
-): Promise<Socket>
-export {}
+export declare function dialDirect(host: string, port: number, timeoutMs?: number): Promise<Socket>;
+export {};
 //# sourceMappingURL=parent-proxy.d.ts.map

@@ -16,7 +16,5 @@
  *   and exists, it will be used. If not provided, falls back to searching local paths and
  *   then global npm install (for native builds where vendor directory isn't bundled).
  */
-export declare function getApplySeccompBinaryPath(
-  seccompBinaryPath?: string,
-): string | null
+export declare function getApplySeccompBinaryPath(seccompBinaryPath?: string): string | null;
 //# sourceMappingURL=generate-seccomp-filter.d.ts.map

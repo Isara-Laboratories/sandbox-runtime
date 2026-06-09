@@ -2,6 +2,7 @@
  * Configuration for Sandbox Runtime
  * This is the main configuration interface that consumers pass to SandboxManager.initialize()
  */
+import { isAbsolute } from 'node:path';
 import { z } from 'zod';
 /**
  * Schema for domain patterns (e.g., "example.com", "*.npmjs.org")
@@ -42,6 +43,17 @@ const domainPatternSchema = z.string().refine(val => {
  * Schema for filesystem paths
  */
 const filesystemPathSchema = z.string().min(1, 'Path cannot be empty');
+/**
+ * Schema for an absolute path to an external binary.
+ * Relative paths are rejected to prevent PATH/CWD-based hijacking — these
+ * overrides are intended for admin-managed installs at fixed locations.
+ */
+const binaryPathSchema = z
+    .string()
+    .min(1, 'Path cannot be empty')
+    .refine(val => isAbsolute(val), {
+    message: 'Binary path must be absolute',
+});
 /**
  * Schema for MITM proxy configuration
  * Allows routing specific domains through an upstream MITM proxy via Unix socket
@@ -127,6 +139,41 @@ export const NetworkConfigSchema = z.object({
         .optional()
         .describe('Port of an external SOCKS proxy to use instead of starting a local one. When provided, the library will skip starting its own SOCKS proxy and use this port. The external proxy must handle domain filtering.'),
     mitmProxy: MitmProxyConfigSchema.optional().describe('Optional MITM proxy configuration. Routes matching domains through an upstream proxy via Unix socket while SRT still handles allow/deny filtering.'),
+    filterRequest: z
+        .custom(v => typeof v === 'function', {
+        message: 'filterRequest must be a function',
+    })
+        .optional()
+        .describe('Per-request filter callback. Receives the parsed HTTP request ' +
+        '(web-standard Request) and returns {action, reason?}. Denied ' +
+        'requests get a 403 with the reason. If the callback throws, the ' +
+        'request is denied. Applies to plain HTTP through the proxy and, ' +
+        'when tlsTerminate is configured, to terminated HTTPS. SRT does not ' +
+        'provide a policy language; library consumers own matching.'),
+    tlsTerminate: z
+        .object({
+        caCertPath: z
+            .string()
+            .min(1)
+            .optional()
+            .describe('Path to a PEM-encoded CA certificate. The sandboxed child is ' +
+            'configured to trust this CA, and the TLS-terminating proxy uses ' +
+            'it to sign per-host certificates. If omitted, SRT generates an ' +
+            'ephemeral CA into a temp directory for the lifetime of the ' +
+            'session.'),
+        caKeyPath: z
+            .string()
+            .min(1)
+            .optional()
+            .describe('Path to the PEM-encoded private key for caCertPath.'),
+    })
+        .refine(o => !o.caCertPath === !o.caKeyPath, {
+        message: 'caCertPath and caKeyPath must be provided together',
+    })
+        .optional()
+        .describe('[EXPERIMENTAL] Enable in-process TLS termination so HTTPS ' +
+        'request/response bodies are visible to SRT. Provide a CA cert+key, ' +
+        'or omit both to have SRT generate an ephemeral one.'),
     parentProxy: ParentProxyConfigSchema.optional().describe("Upstream HTTP proxy for outbound connections. When set, SRT's proxy " +
         'tunnels non-mitmProxy traffic through this parent instead of ' +
         'connecting directly. Falls back to HTTP_PROXY/HTTPS_PROXY/NO_PROXY ' +
@@ -151,7 +198,10 @@ export const FilesystemConfigSchema = z.object({
     allowGitConfig: z
         .boolean()
         .optional()
-        .describe('Allow writes to .git/config files (default: false). Enables git remote URL updates while keeping .git/hooks protected.'),
+        .describe('Allow writes to git config files (default: false). When enabled, ' +
+        'writes are permitted to .git/config, .gitconfig, and .gitmodules ' +
+        '(e.g. for git remote URL updates and `git submodule add`), while ' +
+        '.git/hooks remains protected.'),
 });
 /**
  * Configuration schema for ignoring specific sandbox violations
@@ -173,6 +223,42 @@ export const RipgrepConfigSchema = z.object({
         .string()
         .optional()
         .describe('Override argv[0] when spawning (for multicall binaries that dispatch on argv[0])'),
+});
+/**
+ * Windows-specific configuration schema. See
+ * `windows-sandbox-utils.ts` for the install flow these settings
+ * must agree with.
+ */
+export const WindowsConfigSchema = z.object({
+    groupName: z
+        .string()
+        .min(1)
+        .default('sandbox-runtime-net')
+        .describe('Discriminator group name. Must match the group created at install ' +
+        'time. Ignored if groupSid is set.'),
+    groupSid: z
+        .string()
+        .regex(/^S-1-/, 'must be an S-1-… SID string')
+        .optional()
+        .describe('Discriminator group SID. Overrides groupName lookup — use for ' +
+        'domain groups or where name resolution is unreliable.'),
+    wfpSublayerGuid: z
+        .string()
+        .uuid()
+        .optional()
+        .describe('WFP sublayer GUID under which the filters were installed. Omit to ' +
+        'use the srt-win compile-time default. Set this when filters were ' +
+        'installed by enterprise tooling under a custom sublayer.'),
+    proxyPortRange: z
+        .tuple([z.number().int().min(1), z.number().int().max(65535)])
+        .refine(([lo, hi]) => lo <= hi && hi - lo <= 64, {
+        message: 'low must be ≤ high and range width ≤ 64',
+    })
+        .optional()
+        .describe('Inclusive [low, high] port range the JS http/socks proxies bind ' +
+        'inside. MUST match the range passed to `srt-win wfp install ' +
+        '--proxy-port-range` (default 60080–60089) — the WFP loopback ' +
+        'permit only covers ports in that range.'),
 });
 /**
  * Seccomp configuration schema (Linux only)
@@ -207,6 +293,15 @@ export const SandboxRuntimeConfigSchema = z.object({
         'This is needed for Go programs (gh, gcloud, terraform, kubectl, etc.) to verify TLS certificates ' +
         'when using httpProxyPort with a MITM proxy and custom CA. Enabling this opens a potential data ' +
         'exfiltration vector through the trustd service. Only enable if you need Go TLS verification.'),
+    allowAppleEvents: z
+        .boolean()
+        .optional()
+        .describe('Allow sending Apple Events and Launch Services open requests from the sandbox (macOS only). ' +
+        'Needed for open, osascript, and anything that opens URLs or scripts other apps via AppleScript. ' +
+        'This removes code-execution isolation: sandboxed commands can launch other applications ' +
+        'unsandboxed with no user prompt (launched apps are not subject to the sandbox filesystem or ' +
+        'network restrictions), and can script running apps subject to TCC automation consent. ' +
+        'Default: false.'),
     ripgrep: RipgrepConfigSchema.optional().describe('Custom ripgrep configuration (default: { command: "rg" })'),
     mandatoryDenySearchDepth: z
         .number()
@@ -221,5 +316,14 @@ export const SandboxRuntimeConfigSchema = z.object({
         .optional()
         .describe('Allow pseudo-terminal (pty) operations (macOS only)'),
     seccomp: SeccompConfigSchema.optional().describe('Custom seccomp binary paths (Linux only).'),
+    bwrapPath: binaryPathSchema
+        .optional()
+        .describe('Linux only: absolute path to the bwrap (bubblewrap) binary. ' +
+        'When set, this path is used directly instead of resolving "bwrap" via PATH.'),
+    socatPath: binaryPathSchema
+        .optional()
+        .describe('Linux only: absolute path to the socat binary. ' +
+        'When set, this path is used directly instead of resolving "socat" via PATH.'),
+    windows: WindowsConfigSchema.optional().describe('Windows-specific settings (group, WFP sublayer, proxy port range).'),
 });
 //# sourceMappingURL=sandbox-config.js.map

@@ -1,11 +1,13 @@
 import { createHttpProxyServer } from './http-proxy.js';
 import { createSocksProxyServer } from './socks-proxy.js';
+import { createMitmCA, disposeMitmCA } from './mitm-ca.js';
 import { logForDebugging } from '../utils/debug.js';
 import { whichSync } from '../utils/which.js';
 import { getPlatform, getWslVersion } from '../utils/platform.js';
 import * as fs from 'fs';
 import { wrapCommandWithSandboxLinux, initializeLinuxNetworkBridge, checkLinuxDependencies, cleanupBwrapMountPoints, } from './linux-sandbox-utils.js';
 import { wrapCommandWithSandboxMacOS, startMacOSSandboxLogMonitor, } from './macos-sandbox-utils.js';
+import { checkWindowsDependencies, wrapCommandWithSandboxWindows, DEFAULT_WINDOWS_GROUP_NAME, DEFAULT_WINDOWS_PROXY_PORT_RANGE, } from './windows-sandbox-utils.js';
 import { getDefaultWritePaths, containsGlobChars, removeTrailingGlobSuffix, expandGlobPattern, } from './sandbox-utils.js';
 import { SandboxViolationStore } from './sandbox-violation-store.js';
 import { canonicalizeHost, isValidHost, redactUrl, resolveParentProxy, stripBrackets, } from './parent-proxy.js';
@@ -22,6 +24,7 @@ let initializationPromise;
 let cleanupRegistered = false;
 let logMonitorShutdown;
 let parentProxy;
+let mitmCA;
 const sandboxViolationStore = new SandboxViolationStore();
 // ============================================================================
 // Private Helper Functions (not exported)
@@ -134,52 +137,100 @@ function getMitmSocketPath(host) {
     }
     return undefined;
 }
-async function startHttpProxyServer(sandboxAskCallback) {
+/**
+ * Bind `server.listen()` to the first free port in `[lo, hi]`,
+ * skipping `EADDRINUSE`. With `range` undefined, binds to ephemeral
+ * port 0 (the previous behaviour).
+ *
+ * Used on Windows: the WFP loopback permit only covers a fixed port
+ * range (default 60080–60089), so the JS proxies must bind inside it
+ * for the sandboxed child to reach them. On other platforms the
+ * sandbox layer (seatbelt rule, namespace+socat) targets whatever
+ * port we landed on, so ephemeral is fine.
+ */
+function listenInRange(server, doListen, range, exclude) {
+    return new Promise((resolve, reject) => {
+        const [lo, hi] = range ?? [0, 0];
+        let port = lo;
+        const tryNext = () => {
+            while (exclude.has(port) && port <= hi)
+                port++;
+            if (port > hi) {
+                reject(new Error(`No free port in range ${lo}-${hi} (excluding ${[...exclude].join(',')})`));
+                return;
+            }
+            const onListening = () => {
+                server.removeListener('error', onError);
+                resolve();
+            };
+            const onError = (err) => {
+                // The paired 'listening' once-listener never fired; drop it
+                // so retries don't accumulate stale listeners.
+                server.removeListener('listening', onListening);
+                if (range &&
+                    err?.code === 'EADDRINUSE' &&
+                    port < hi) {
+                    port++;
+                    tryNext();
+                    return;
+                }
+                reject(err ?? new Error('listen error'));
+            };
+            server.once('error', onError);
+            server.once('listening', onListening);
+            doListen(range ? port : 0);
+        };
+        tryNext();
+    });
+}
+async function startHttpProxyServer(sandboxAskCallback, portRange, excludePorts) {
     httpProxyServer = createHttpProxyServer({
         filter: (port, host) => filterNetworkRequest(port, host, sandboxAskCallback),
         getMitmSocketPath,
+        mitmCA,
+        filterRequest: config?.network.filterRequest,
         parentProxy,
     });
-    return new Promise((resolve, reject) => {
-        if (!httpProxyServer) {
-            reject(new Error('HTTP proxy server undefined before listen'));
-            return;
-        }
-        const server = httpProxyServer;
-        server.once('error', reject);
-        server.once('listening', () => {
-            const address = server.address();
-            if (address && typeof address === 'object') {
-                server.unref();
-                logForDebugging(`HTTP proxy listening on localhost:${address.port}`);
-                resolve(address.port);
-            }
-            else {
-                reject(new Error('Failed to get proxy server address'));
-            }
-        });
-        server.listen(0, '127.0.0.1');
-    });
+    const server = httpProxyServer;
+    await listenInRange(server, p => server.listen(p, '127.0.0.1'), portRange, excludePorts);
+    const address = server.address();
+    if (!address || typeof address !== 'object') {
+        throw new Error('Failed to get HTTP proxy server address');
+    }
+    server.unref();
+    logForDebugging(`HTTP proxy listening on localhost:${address.port}`);
+    return address.port;
 }
-async function startSocksProxyServer(sandboxAskCallback) {
+async function startSocksProxyServer(sandboxAskCallback, portRange, excludePorts) {
     socksProxyServer = createSocksProxyServer({
         filter: (port, host) => filterNetworkRequest(port, host, sandboxAskCallback),
         parentProxy,
     });
-    return new Promise((resolve, reject) => {
-        if (!socksProxyServer) {
-            // This is mostly just for the typechecker
-            reject(new Error('SOCKS proxy server undefined before listen'));
-            return;
+    const wrapper = socksProxyServer;
+    // SocksProxyWrapper.listen() resolves with the bound port; we
+    // adapt it to the listenInRange shape by retrying on EADDRINUSE
+    // here directly rather than via the once('error') path.
+    if (!portRange) {
+        const port = await wrapper.listen(0, '127.0.0.1');
+        wrapper.unref();
+        return port;
+    }
+    let lastErr;
+    for (let p = portRange[0]; p <= portRange[1]; p++) {
+        if (excludePorts.has(p))
+            continue;
+        try {
+            const port = await wrapper.listen(p, '127.0.0.1');
+            wrapper.unref();
+            return port;
         }
-        socksProxyServer
-            .listen(0, '127.0.0.1')
-            .then((port) => {
-            socksProxyServer?.unref();
-            resolve(port);
-        })
-            .catch(reject);
-    });
+        catch (err) {
+            lastErr = err;
+            if (err?.code !== 'EADDRINUSE')
+                throw err;
+        }
+    }
+    throw new Error(`No free SOCKS port in range ${portRange[0]}-${portRange[1]}: ${lastErr?.message ?? 'all in use'}`);
 }
 // ============================================================================
 // Public Module Functions (will be exported via namespace)
@@ -199,6 +250,14 @@ async function initialize(runtimeConfig, sandboxAskCallback, enableLogMonitor = 
         logForDebugging(`Parent proxy configured: http=${redactUrl(parentProxy.httpUrl)} ` +
             `https=${redactUrl(parentProxy.httpsUrl)}`);
     }
+    // Load TLS-termination CA if configured. Throws on unreadable/non-PEM —
+    // tlsTerminate is explicit opt-in, so a bad config is a hard error.
+    if (runtimeConfig.network.tlsTerminate && runtimeConfig.network.mitmProxy) {
+        throw new Error('network.tlsTerminate and network.mitmProxy are mutually exclusive');
+    }
+    mitmCA = runtimeConfig.network.tlsTerminate
+        ? createMitmCA(runtimeConfig.network.tlsTerminate)
+        : undefined;
     // Check dependencies
     const deps = checkDependencies();
     if (deps.errors.length > 0) {
@@ -214,6 +273,13 @@ async function initialize(runtimeConfig, sandboxAskCallback, enableLogMonitor = 
     // Initialize network infrastructure
     initializationPromise = (async () => {
         try {
+            // On Windows the WFP loopback permit covers a fixed port
+            // range, so the proxies must bind inside it. Other platforms
+            // bake the actual ephemeral port into the sandbox profile, so
+            // they keep using port 0.
+            const portRange = getPlatform() === 'windows'
+                ? (config.windows?.proxyPortRange ?? DEFAULT_WINDOWS_PROXY_PORT_RANGE)
+                : undefined;
             // Conditionally start proxy servers based on config
             let httpProxyPort;
             if (config.network.httpProxyPort !== undefined) {
@@ -223,7 +289,7 @@ async function initialize(runtimeConfig, sandboxAskCallback, enableLogMonitor = 
             }
             else {
                 // Start local HTTP proxy
-                httpProxyPort = await startHttpProxyServer(sandboxAskCallback);
+                httpProxyPort = await startHttpProxyServer(sandboxAskCallback, portRange, new Set());
             }
             let socksProxyPort;
             if (config.network.socksProxyPort !== undefined) {
@@ -232,13 +298,14 @@ async function initialize(runtimeConfig, sandboxAskCallback, enableLogMonitor = 
                 logForDebugging(`Using external SOCKS proxy on port ${socksProxyPort}`);
             }
             else {
-                // Start local SOCKS proxy
-                socksProxyPort = await startSocksProxyServer(sandboxAskCallback);
+                // Start local SOCKS proxy. Skip the port the HTTP proxy
+                // already took.
+                socksProxyPort = await startSocksProxyServer(sandboxAskCallback, portRange, new Set([httpProxyPort]));
             }
             // Initialize platform-specific infrastructure
             let linuxBridge;
             if (getPlatform() === 'linux') {
-                linuxBridge = await initializeLinuxNetworkBridge(httpProxyPort, socksProxyPort);
+                linuxBridge = await initializeLinuxNetworkBridge(httpProxyPort, socksProxyPort, config.socatPath);
             }
             const context = {
                 httpProxyPort,
@@ -269,7 +336,17 @@ function isSupportedPlatform() {
         // WSL1 doesn't support bubblewrap
         return getWslVersion() !== '1';
     }
-    return platform === 'macos';
+    return platform === 'macos' || platform === 'windows';
+}
+/**
+ * Resolve the Windows group reference from config. Used by both the
+ * dependency check and `wrapWithSandbox` so they agree.
+ */
+function getWindowsGroupRef() {
+    return {
+        groupName: config?.windows?.groupName ?? DEFAULT_WINDOWS_GROUP_NAME,
+        groupSid: config?.windows?.groupSid,
+    };
 }
 function isSandboxingEnabled() {
     // Sandboxing is enabled if config has been set (via initialize())
@@ -286,16 +363,27 @@ function checkDependencies(ripgrepConfig) {
     }
     const errors = [];
     const warnings = [];
-    // Check ripgrep - use provided config, then initialized config, then default 'rg'
-    const rgToCheck = ripgrepConfig ?? config?.ripgrep ?? { command: 'rg' };
-    if (whichSync(rgToCheck.command) === null) {
-        errors.push(`ripgrep (${rgToCheck.command}) not found`);
-    }
     const platform = getPlatform();
     if (platform === 'linux') {
-        const linuxDeps = checkLinuxDependencies(config?.seccomp);
+        // ripgrep is Linux-only: it's used by linuxGetMandatoryDenyPaths() to
+        // expand glob deny-patterns to concrete paths for bwrap. macOS seatbelt
+        // profiles take regex patterns directly, so rg is never invoked there.
+        const rgToCheck = ripgrepConfig ?? config?.ripgrep ?? { command: 'rg' };
+        if (whichSync(rgToCheck.command) === null) {
+            errors.push(`ripgrep (${rgToCheck.command}) not found`);
+        }
+        const linuxDeps = checkLinuxDependencies({
+            seccompConfig: config?.seccomp,
+            bwrapPath: config?.bwrapPath,
+            socatPath: config?.socatPath,
+        });
         errors.push(...linuxDeps.errors);
         warnings.push(...linuxDeps.warnings);
+    }
+    else if (platform === 'windows') {
+        const winDeps = checkWindowsDependencies(getWindowsGroupRef(), config?.windows?.wfpSublayerGuid);
+        errors.push(...winDeps.errors);
+        warnings.push(...winDeps.warnings);
     }
     return { errors, warnings };
 }
@@ -397,6 +485,9 @@ function getEnableWeakerNestedSandbox() {
 function getEnableWeakerNetworkIsolation() {
     return config?.enableWeakerNetworkIsolation;
 }
+function getAllowAppleEvents() {
+    return config?.allowAppleEvents;
+}
 function getRipgrepConfig() {
     return config?.ripgrep ?? { command: 'rg' };
 }
@@ -485,6 +576,12 @@ async function wrapWithSandbox(command, binShell, customConfig, abortSignal) {
             expandedAllowRead.push(stripped);
         }
     }
+    // The TLS-termination CA cert must be readable by the child so the trust
+    // env vars (NODE_EXTRA_CA_CERTS etc.) resolve, even if its path falls
+    // under a user-configured denyRead.
+    if (mitmCA) {
+        expandedAllowRead.push(mitmCA.certPath);
+    }
     const readConfig = {
         denyOnly: expandedDenyRead,
         allowWithinDeny: expandedAllowRead,
@@ -529,6 +626,7 @@ async function wrapWithSandbox(command, binShell, customConfig, abortSignal) {
                 // Only pass proxy ports if proxy is running (when there are domains to filter)
                 httpProxyPort: needsNetworkProxy ? getProxyPort() : undefined,
                 socksProxyPort: needsNetworkProxy ? getSocksProxyPort() : undefined,
+                caCertPath: mitmCA?.certPath,
                 readConfig,
                 writeConfig,
                 allowUnixSockets: getAllowUnixSockets(),
@@ -539,6 +637,7 @@ async function wrapWithSandbox(command, binShell, customConfig, abortSignal) {
                 allowPty,
                 allowGitConfig: getAllowGitConfig(),
                 enableWeakerNetworkIsolation: getEnableWeakerNetworkIsolation(),
+                allowAppleEvents: getAllowAppleEvents(),
                 binShell,
             });
         case 'linux':
@@ -558,6 +657,7 @@ async function wrapWithSandbox(command, binShell, customConfig, abortSignal) {
                 socksProxyPort: needsNetworkProxy
                     ? managerContext?.socksProxyPort
                     : undefined,
+                caCertPath: mitmCA?.certPath,
                 readConfig,
                 writeConfig,
                 enableWeakerNestedSandbox: getEnableWeakerNestedSandbox(),
@@ -567,12 +667,57 @@ async function wrapWithSandbox(command, binShell, customConfig, abortSignal) {
                 mandatoryDenySearchDepth: getMandatoryDenySearchDepth(),
                 allowGitConfig: getAllowGitConfig(),
                 seccompConfig: getSeccompConfig(),
+                bwrapPath: config?.bwrapPath,
+                socatPath: config?.socatPath,
                 abortSignal,
             });
+        case 'windows':
+            // Windows wraps to an argv array, not a shell string. Forcing
+            // callers through wrapWithSandboxArgv() means they spawn with
+            // {shell:false}, which is the security boundary that keeps the
+            // user's command bytes off the HOST shell.
+            throw new Error('wrapWithSandbox() returns a shell string and is not supported ' +
+                'on Windows. Use SandboxManager.wrapWithSandboxArgv() and ' +
+                'spawn the result with {shell: false}.');
         default:
             // Unsupported platform - this should not happen since isSandboxingEnabled() checks platform support
             throw new Error(`Sandbox configuration is not supported on platform: ${platform}`);
     }
+}
+/**
+ * Wrap `command` for the sandbox and return a spawn descriptor:
+ * `{ argv, env }`, suitable for
+ * `spawn(argv[0], argv.slice(1), {shell: false, env})`.
+ *
+ * On Windows this is the ONLY supported wrap method (see
+ * {@link wrapWithSandbox}); `env` carries the full proxy set that the
+ * sandboxed child inherits (`srt-win exec` forwards its environment
+ * verbatim — see {@link wrapCommandWithSandboxWindows}). On
+ * macOS/Linux `argv` is `[binShell, '-c', <wrapWithSandbox result>]`
+ * (proxy env is baked into that command) and `env` is the unchanged
+ * `process.env`, so callers can spawn uniformly across platforms.
+ */
+async function wrapWithSandboxArgv(command, binShell, customConfig, abortSignal) {
+    const platform = getPlatform();
+    if (platform === 'windows') {
+        const hasNetworkConfig = customConfig?.network?.allowedDomains !== undefined ||
+            config?.network?.allowedDomains !== undefined;
+        if (hasNetworkConfig) {
+            await waitForNetworkInitialization();
+        }
+        return wrapCommandWithSandboxWindows({
+            command,
+            group: getWindowsGroupRef(),
+            httpProxyPort: hasNetworkConfig ? getProxyPort() : undefined,
+            socksProxyPort: hasNetworkConfig ? getSocksProxyPort() : undefined,
+            binShell,
+        });
+    }
+    // macOS/Linux: delegate to the existing string wrapper, then put
+    // the result behind `<shell> -c` so the caller's argv-spawn works.
+    const wrapped = await wrapWithSandbox(command, binShell, customConfig, abortSignal);
+    const shell = binShell ?? '/bin/bash';
+    return { argv: [shell, '-c', wrapped], env: process.env };
 }
 /**
  * Get the current sandbox configuration
@@ -582,12 +727,30 @@ function getConfig() {
     return config;
 }
 /**
- * Update the sandbox configuration
+ * Update the sandbox configuration in place.
+ *
+ * **Network/allowlist changes are a live swap**: the running
+ * http/socks proxies read `config.network.allowedDomains` /
+ * `deniedDomains` per-request (via `filterNetworkRequest`), so
+ * reassigning `config` here takes effect on the next connection
+ * with no proxy rebind and no port change — on every platform,
+ * including Windows. This is what lets a host enable/deny domains
+ * for already-running sandboxed children.
+ *
+ * Filesystem changes (denyRead/denyWrite) are NOT applied live:
+ * macOS bakes them into the seatbelt profile at wrap time, and
+ * Windows will need an explicit re-stamp. To change FS
+ * restrictions, reset() then initialize() with the new config.
+ *
  * @param newConfig - The new configuration to use
  */
 function updateConfig(newConfig) {
-    // Deep clone the config to avoid mutations
-    config = structuredClone(newConfig);
+    // Deep clone the config to avoid mutations. structuredClone cannot clone
+    // functions, so pull filterRequest out, clone the rest, and put it back —
+    // a function reference is immutable in the sense that matters here.
+    const { filterRequest, ...rest } = newConfig.network;
+    config = structuredClone({ ...newConfig, network: rest });
+    config.network.filterRequest = filterRequest;
     // Re-resolve parent proxy so hot-reload picks up changes. Note: the proxy
     // servers capture `parentProxy` by value at creation, so changes here take
     // effect only on re-initialize. This keeps the state consistent for the
@@ -608,6 +771,115 @@ function updateConfig(newConfig) {
 function cleanupAfterCommand() {
     cleanupBwrapMountPoints();
 }
+/**
+ * How long to wait for a bridge process to exit after SIGTERM before
+ * escalating to SIGKILL.
+ *
+ * socat exits within ~10ms of SIGTERM; this is purely a safety margin.
+ * Keep it well below bun's default 5s test/hook timeout: when a bridge's
+ * `'exit'` event is missed entirely (a Linux-only Bun pidfd notification
+ * bug, oven-sh/bun#30301), this timer is the only thing that lets `reset()`
+ * make progress, and a 5000ms value here loses the race against the hook
+ * timer by a couple of milliseconds — that race was the dominant CI flake.
+ */
+const BRIDGE_EXIT_TIMEOUT_MS = 1500;
+/**
+ * SIGTERM a bridge process and resolve once it has exited.
+ *
+ * Returns immediately if the process has already exited (`.exitCode` /
+ * `.signalCode` set) — registering `.once('exit')` after the event has
+ * already been emitted produces a listener that never fires.
+ *
+ * Falls back to SIGKILL after {@link BRIDGE_EXIT_TIMEOUT_MS}.
+ */
+function killBridgeProcess(proc, label) {
+    // Already exited → 'exit' already emitted → a fresh once('exit') would
+    // never fire. Don't wait on it.
+    if (!proc.pid || proc.exitCode !== null || proc.signalCode !== null) {
+        return Promise.resolve();
+    }
+    try {
+        process.kill(proc.pid, 'SIGTERM');
+        logForDebugging(`Sent SIGTERM to ${label} bridge process`);
+    }
+    catch (err) {
+        if (err.code !== 'ESRCH') {
+            logForDebugging(`Error killing ${label} bridge: ${err}`, {
+                level: 'error',
+            });
+        }
+        // ESRCH = process already gone; nothing to wait for either way.
+        return Promise.resolve();
+    }
+    return new Promise(resolve => {
+        let settled = false;
+        const done = () => {
+            if (settled)
+                return;
+            settled = true;
+            clearTimeout(timer);
+            resolve();
+        };
+        proc.once('exit', () => {
+            logForDebugging(`${label} bridge process exited`);
+            done();
+        });
+        const timer = setTimeout(() => {
+            // Re-check liveness — the 'exit' may have raced us.
+            if (proc.exitCode === null && proc.signalCode === null) {
+                logForDebugging(`${label} bridge did not exit, forcing SIGKILL`, {
+                    level: 'warn',
+                });
+                try {
+                    if (proc.pid)
+                        process.kill(proc.pid, 'SIGKILL');
+                }
+                catch {
+                    // Process may have already exited
+                }
+            }
+            done();
+        }, BRIDGE_EXIT_TIMEOUT_MS);
+        // The bridge process is being torn down; this timer must not be the
+        // only thing keeping the event loop alive.
+        timer.unref?.();
+    });
+}
+/**
+ * Forcibly close an http.Server, including any in-flight requests.
+ *
+ * Plain `server.close()` waits for every active request to finish.
+ * The proxy may be mid-upstream-request when reset() runs (e.g. a test's
+ * curl was killed by --max-time while the proxy was still dialing the
+ * real example.com / api.github.com), and `dialDirect()` allows up to
+ * 30s before giving up. Combined with a socat fork that hasn't yet seen
+ * its unix-socket EOF, that leaves a fully-open inbound connection and
+ * `server.close()` never calls back. `closeAllConnections()` (Node 18.2+,
+ * also implemented in Bun) tears down those sockets so `close()` resolves
+ * immediately.
+ */
+function forceCloseHttpServer(server) {
+    return new Promise(resolve => {
+        // Must run *before* close(): in Bun, close() also detaches the
+        // underlying handle, so a closeAllConnections() called afterwards
+        // becomes a no-op and the close callback waits for the in-flight
+        // request to drain — defeating the purpose. With closeAllConnections()
+        // first, the connections are gone by the time close() runs and its
+        // callback fires immediately (Bun reports "Server is not running.",
+        // Node reports no error). Verified against both orderings.
+        if (typeof server.closeAllConnections === 'function') {
+            server.closeAllConnections();
+        }
+        server.close(error => {
+            if (error && error.message !== 'Server is not running.') {
+                logForDebugging(`Error closing HTTP proxy server: ${error.message}`, {
+                    level: 'error',
+                });
+            }
+            resolve();
+        });
+    });
+}
 async function reset() {
     // Clean up any leftover bwrap mount points. Force past the
     // active-sandbox counter — reset() means the session is over.
@@ -619,86 +891,11 @@ async function reset() {
     }
     if (managerContext?.linuxBridge) {
         const { httpSocketPath, socksSocketPath, httpBridgeProcess, socksBridgeProcess, } = managerContext.linuxBridge;
-        // Create array to wait for process exits
-        const exitPromises = [];
-        // Kill HTTP bridge and wait for it to exit
-        if (httpBridgeProcess.pid && !httpBridgeProcess.killed) {
-            try {
-                process.kill(httpBridgeProcess.pid, 'SIGTERM');
-                logForDebugging('Sent SIGTERM to HTTP bridge process');
-                // Wait for process to exit
-                exitPromises.push(new Promise(resolve => {
-                    httpBridgeProcess.once('exit', () => {
-                        logForDebugging('HTTP bridge process exited');
-                        resolve();
-                    });
-                    // Timeout after 5 seconds
-                    setTimeout(() => {
-                        if (!httpBridgeProcess.killed) {
-                            logForDebugging('HTTP bridge did not exit, forcing SIGKILL', {
-                                level: 'warn',
-                            });
-                            try {
-                                if (httpBridgeProcess.pid) {
-                                    process.kill(httpBridgeProcess.pid, 'SIGKILL');
-                                }
-                            }
-                            catch {
-                                // Process may have already exited
-                            }
-                        }
-                        resolve();
-                    }, 5000);
-                }));
-            }
-            catch (err) {
-                if (err.code !== 'ESRCH') {
-                    logForDebugging(`Error killing HTTP bridge: ${err}`, {
-                        level: 'error',
-                    });
-                }
-            }
-        }
-        // Kill SOCKS bridge and wait for it to exit
-        if (socksBridgeProcess.pid && !socksBridgeProcess.killed) {
-            try {
-                process.kill(socksBridgeProcess.pid, 'SIGTERM');
-                logForDebugging('Sent SIGTERM to SOCKS bridge process');
-                // Wait for process to exit
-                exitPromises.push(new Promise(resolve => {
-                    socksBridgeProcess.once('exit', () => {
-                        logForDebugging('SOCKS bridge process exited');
-                        resolve();
-                    });
-                    // Timeout after 5 seconds
-                    setTimeout(() => {
-                        if (!socksBridgeProcess.killed) {
-                            logForDebugging('SOCKS bridge did not exit, forcing SIGKILL', {
-                                level: 'warn',
-                            });
-                            try {
-                                if (socksBridgeProcess.pid) {
-                                    process.kill(socksBridgeProcess.pid, 'SIGKILL');
-                                }
-                            }
-                            catch {
-                                // Process may have already exited
-                            }
-                        }
-                        resolve();
-                    }, 5000);
-                }));
-            }
-            catch (err) {
-                if (err.code !== 'ESRCH') {
-                    logForDebugging(`Error killing SOCKS bridge: ${err}`, {
-                        level: 'error',
-                    });
-                }
-            }
-        }
-        // Wait for both processes to exit
-        await Promise.all(exitPromises);
+        // Kill both bridges and wait for them to exit
+        await Promise.all([
+            killBridgeProcess(httpBridgeProcess, 'HTTP'),
+            killBridgeProcess(socksBridgeProcess, 'SOCKS'),
+        ]);
         // Clean up sockets
         if (httpSocketPath) {
             try {
@@ -725,19 +922,11 @@ async function reset() {
     }
     // Close servers in parallel (only if they exist, i.e., were started by us)
     const closePromises = [];
+    if (mitmCA) {
+        closePromises.push(disposeMitmCA(mitmCA));
+    }
     if (httpProxyServer) {
-        const server = httpProxyServer; // Capture reference to avoid TypeScript error
-        const httpClose = new Promise(resolve => {
-            server.close(error => {
-                if (error && error.message !== 'Server is not running.') {
-                    logForDebugging(`Error closing HTTP proxy server: ${error.message}`, {
-                        level: 'error',
-                    });
-                }
-                resolve();
-            });
-        });
-        closePromises.push(httpClose);
+        closePromises.push(forceCloseHttpServer(httpProxyServer));
     }
     if (socksProxyServer) {
         const socksClose = socksProxyServer.close().catch((error) => {
@@ -755,6 +944,7 @@ async function reset() {
     managerContext = undefined;
     initializationPromise = undefined;
     parentProxy = undefined;
+    mitmCA = undefined;
 }
 function getSandboxViolationStore() {
     return sandboxViolationStore;
@@ -831,8 +1021,10 @@ export const SandboxManager = {
     getLinuxSocksSocketPath,
     waitForNetworkInitialization,
     wrapWithSandbox,
+    wrapWithSandboxArgv,
     cleanupAfterCommand,
     reset,
+    getMitmCA: () => mitmCA,
     getSandboxViolationStore,
     annotateStderrWithSandboxFailures,
     getLinuxGlobPatternWarnings,
