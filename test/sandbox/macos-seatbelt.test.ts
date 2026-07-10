@@ -867,6 +867,33 @@ describe.if(isMacOS)('macOS Seatbelt Process Enumeration', () => {
   })
 })
 
+describe.if(isMacOS)('macOS Seatbelt Keychain access', () => {
+  const keychainCommand = wrapCommandWithSandboxMacOS({
+    command: 'true',
+    needsNetworkRestriction: true,
+    readConfig: undefined,
+    writeConfig: undefined,
+  })
+
+  it('should allow legacy SecurityServer Keychain IPC', () => {
+    expect(keychainCommand).toContain(
+      '(allow mach-lookup (global-name \\"com.apple.SecurityServer\\"))',
+    )
+  })
+
+  it('should allow secd Keychain IPC on macOS 13 and later', () => {
+    expect(keychainCommand).toContain(
+      '(allow mach-lookup (global-name \\"com.apple.secd\\"))',
+    )
+  })
+
+  it('should allow the Keychain client sandbox preflight check', () => {
+    expect(keychainCommand).toContain(
+      '(sysctl-name \\"security.mac.sandbox.sentinel\\")',
+    )
+  })
+})
+
 describe.if(isMacOS)('macOS Seatbelt allowMachLookup', () => {
   it('should emit global-name and global-name-prefix rules for configured services', () => {
     const wrappedCommand = wrapCommandWithSandboxMacOS({
