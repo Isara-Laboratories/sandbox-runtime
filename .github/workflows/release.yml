@@ -6,7 +6,6 @@ on:
 
 permissions:
   contents: read
-  id-token: write
 
 jobs:
   build-seccomp:
@@ -32,11 +31,12 @@ jobs:
           path: vendor/seccomp/${{ matrix.arch }}
           if-no-files-found: error
 
-  publish:
-    name: Publish to npm
+  package:
+    name: Publish GitHub release tarball
     needs: build-seccomp
     runs-on: ubuntu-latest
-    environment: npm
+    permissions:
+      contents: write
     steps:
       - uses: actions/checkout@v4
         with:
@@ -62,7 +62,6 @@ jobs:
       - uses: actions/setup-node@v4
         with:
           node-version: '18'
-          registry-url: 'https://registry.npmjs.org'
 
       - uses: actions/download-artifact@v4
         with:
@@ -74,10 +73,13 @@ jobs:
           path: vendor/seccomp/arm64
       - run: chmod +x vendor/seccomp/*/apply-seccomp
 
-      - run: npm install
-      - run: npm run clean && npm run build
+      - run: npm ci
+      - run: npm run clean && npm run build && cp -R vendor dist/
 
-      - name: Publish to npm
-        run: npm publish --provenance --access public
+      - name: Pack and upload release asset
+        run: |
+          TARBALL="anthropic-ai-sandbox-runtime-${GITHUB_REF_NAME#v}.tgz"
+          npm pack
+          gh release upload "$GITHUB_REF_NAME" "$TARBALL" --clobber --repo "$GITHUB_REPOSITORY"
         env:
-          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+          GH_TOKEN: ${{ github.token }}
