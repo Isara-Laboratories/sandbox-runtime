@@ -331,11 +331,18 @@ Examples:
 
 **Path Syntax (Linux):**
 
-**Linux currently does not support glob matching.** Use literal paths only:
+On Linux, `denyRead` and `denyWrite` globs are expanded to concrete paths that
+exist when the sandbox command is prepared. `allowWrite` globs are not
+supported because bubblewrap can grant writes only to concrete paths.
 
 - `"allowWrite": ["src/"]` - Allow write to `src/` directory
 - `"denyRead": ["/home/user/.ssh"]` - Deny read to SSH directory
 - `"denyRead": ["/home"], "allowRead": ["."]` - Deny read to all of `/home`, but re-allow the current directory
+- `"denyWrite": ["**/.env"]` - Deny writes to matching `.env` files that exist when the command starts
+
+Glob expansion is a startup snapshot. A `denyWrite` glob does not block a new
+matching path that is created after expansion. Use a literal path when the
+sandbox must also block creation of a known path.
 
 **All platforms:**
 
