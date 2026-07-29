@@ -154,6 +154,8 @@ describe('expandGlobPatterns', () => {
   const RAW_BASE_DIR = join(tmpdir(), 'glob-expand-batch-test-' + Date.now())
   const FIRST_DIR = join(RAW_BASE_DIR, 'first tree')
   const SECOND_DIR = join(RAW_BASE_DIR, 'second-tree')
+  let REAL_FIRST_DIR: string
+  let REAL_SECOND_DIR: string
 
   beforeAll(() => {
     mkdirSync(join(FIRST_DIR, 'nested'), { recursive: true })
@@ -165,6 +167,8 @@ describe('expandGlobPatterns', () => {
     writeFileSync(join(FIRST_DIR, 'nested', 'line\nbreak.env'), 'ODD=value')
     writeFileSync(join(FIRST_DIR, 'nested', 'choicea.env'), 'CHOICE=value')
     writeFileSync(join(SECOND_DIR, 'other.env'), 'OTHER=value')
+    REAL_FIRST_DIR = realPath(FIRST_DIR)
+    REAL_SECOND_DIR = realPath(SECOND_DIR)
   })
 
   afterAll(() => {
@@ -180,16 +184,16 @@ describe('expandGlobPatterns', () => {
 
     expect(results.get(recursiveEnv)).toEqual(
       expect.arrayContaining([
-        join(FIRST_DIR, '.env'),
-        join(FIRST_DIR, '.env.example'),
-        join(FIRST_DIR, 'nested', '.env.local'),
-        join(FIRST_DIR, 'nested', '.env.local.example'),
+        join(REAL_FIRST_DIR, '.env'),
+        join(REAL_FIRST_DIR, '.env.example'),
+        join(REAL_FIRST_DIR, 'nested', '.env.local'),
+        join(REAL_FIRST_DIR, 'nested', '.env.local.example'),
       ]),
     )
     expect(results.get(examples)).toEqual([
-      join(FIRST_DIR, 'nested', '.env.local.example'),
+      join(REAL_FIRST_DIR, 'nested', '.env.local.example'),
     ])
-    expect(results.get(otherTree)).toEqual([join(SECOND_DIR, 'other.env')])
+    expect(results.get(otherTree)).toEqual([join(REAL_SECOND_DIR, 'other.env')])
   })
 
   it('preserves spaces and newlines in matched paths', () => {
@@ -197,7 +201,7 @@ describe('expandGlobPatterns', () => {
     const results = expandGlobPatterns([pattern])
 
     expect(results.get(pattern)).toContain(
-      join(FIRST_DIR, 'nested', 'line\nbreak.env'),
+      join(REAL_FIRST_DIR, 'nested', 'line\nbreak.env'),
     )
   })
 
@@ -206,7 +210,7 @@ describe('expandGlobPatterns', () => {
     const results = expandGlobPatterns([pattern, pattern])
 
     expect(results.get(pattern)).toEqual([
-      join(FIRST_DIR, 'nested', 'choicea.env'),
+      join(REAL_FIRST_DIR, 'nested', 'choicea.env'),
     ])
   })
 
