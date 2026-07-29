@@ -28,7 +28,7 @@ import {
   getDefaultWritePaths,
   containsGlobChars,
   removeTrailingGlobSuffix,
-  expandGlobPattern,
+  expandGlobPatterns,
 } from './sandbox-utils.js'
 import { SandboxViolationStore } from './sandbox-violation-store.js'
 import {
@@ -403,45 +403,44 @@ function checkDependencies(ripgrepConfig?: {
   return { errors, warnings }
 }
 
+function expandFsReadConfig(
+  denyRead: readonly string[],
+  allowRead: readonly string[],
+): FsReadRestrictionConfig {
+  const readPatterns = [...denyRead, ...allowRead]
+  const globPatterns = readPatterns.filter(p => {
+    const stripped = removeTrailingGlobSuffix(p)
+    return getPlatform() === 'linux' && containsGlobChars(stripped)
+  })
+  const expandedGlobs = expandGlobPatterns(globPatterns)
+
+  const expandPaths = (paths: readonly string[], kind: string): string[] =>
+    paths.flatMap(p => {
+      const stripped = removeTrailingGlobSuffix(p)
+      if (getPlatform() !== 'linux' || !containsGlobChars(stripped)) {
+        return [stripped]
+      }
+      const expanded = expandedGlobs.get(p) ?? []
+      logForDebugging(
+        `[Sandbox] Expanded ${kind} glob pattern "${p}" to ${expanded.length} paths on Linux`,
+      )
+      return expanded
+    })
+
+  return {
+    denyOnly: expandPaths(denyRead, 'denyRead'),
+    allowWithinDeny: expandPaths(allowRead, 'allowRead'),
+  }
+}
+
 function getFsReadConfig(): FsReadRestrictionConfig {
   if (!config) {
     return { denyOnly: [], allowWithinDeny: [] }
   }
-
-  const denyPaths: string[] = []
-  for (const p of config.filesystem.denyRead) {
-    const stripped = removeTrailingGlobSuffix(p)
-    if (getPlatform() === 'linux' && containsGlobChars(stripped)) {
-      // Expand glob to concrete paths on Linux (bubblewrap doesn't support globs)
-      const expanded = expandGlobPattern(p)
-      logForDebugging(
-        `[Sandbox] Expanded glob pattern "${p}" to ${expanded.length} paths on Linux`,
-      )
-      denyPaths.push(...expanded)
-    } else {
-      denyPaths.push(stripped)
-    }
-  }
-
-  // Process allowRead paths (re-allow within denied regions)
-  const allowPaths: string[] = []
-  for (const p of config.filesystem.allowRead ?? []) {
-    const stripped = removeTrailingGlobSuffix(p)
-    if (getPlatform() === 'linux' && containsGlobChars(stripped)) {
-      const expanded = expandGlobPattern(p)
-      logForDebugging(
-        `[Sandbox] Expanded allowRead glob pattern "${p}" to ${expanded.length} paths on Linux`,
-      )
-      allowPaths.push(...expanded)
-    } else {
-      allowPaths.push(stripped)
-    }
-  }
-
-  return {
-    denyOnly: denyPaths,
-    allowWithinDeny: allowPaths,
-  }
+  return expandFsReadConfig(
+    config.filesystem.denyRead,
+    config.filesystem.allowRead ?? [],
+  )
 }
 
 function getFsWriteConfig(): FsWriteRestrictionConfig {
@@ -609,32 +608,10 @@ async function wrapWithSandbox(
       customConfig?.filesystem?.denyWrite ?? config?.filesystem.denyWrite ?? [],
     ),
   }
-  const rawDenyRead =
-    customConfig?.filesystem?.denyRead ?? config?.filesystem.denyRead ?? []
-  const expandedDenyRead: string[] = []
-  for (const p of rawDenyRead) {
-    const stripped = removeTrailingGlobSuffix(p)
-    if (getPlatform() === 'linux' && containsGlobChars(stripped)) {
-      expandedDenyRead.push(...expandGlobPattern(p))
-    } else {
-      expandedDenyRead.push(stripped)
-    }
-  }
-  const rawAllowRead =
-    customConfig?.filesystem?.allowRead ?? config?.filesystem.allowRead ?? []
-  const expandedAllowRead: string[] = []
-  for (const p of rawAllowRead) {
-    const stripped = removeTrailingGlobSuffix(p)
-    if (getPlatform() === 'linux' && containsGlobChars(stripped)) {
-      expandedAllowRead.push(...expandGlobPattern(p))
-    } else {
-      expandedAllowRead.push(stripped)
-    }
-  }
-  const readConfig = {
-    denyOnly: expandedDenyRead,
-    allowWithinDeny: expandedAllowRead,
-  }
+  const readConfig = expandFsReadConfig(
+    customConfig?.filesystem?.denyRead ?? config?.filesystem.denyRead ?? [],
+    customConfig?.filesystem?.allowRead ?? config?.filesystem.allowRead ?? [],
+  )
 
   // Check if network config is specified - this determines if we need network restrictions
   // Network restriction is needed when:
