@@ -5,11 +5,14 @@ import {
   rmSync,
   existsSync,
   realpathSync,
+  chmodSync,
+  readFileSync,
 } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import {
   expandGlobPattern,
+  expandGlobPatterns,
   globToRegex,
 } from '../../src/sandbox/sandbox-utils.js'
 import { isLinux } from '../helpers/platform.js'
@@ -147,6 +150,108 @@ describe('expandGlobPattern', () => {
   })
 })
 
+describe('expandGlobPatterns', () => {
+  const RAW_BASE_DIR = join(tmpdir(), 'glob-expand-batch-test-' + Date.now())
+  const FIRST_DIR = join(RAW_BASE_DIR, 'first tree')
+  const SECOND_DIR = join(RAW_BASE_DIR, 'second-tree')
+
+  beforeAll(() => {
+    mkdirSync(join(FIRST_DIR, 'nested'), { recursive: true })
+    mkdirSync(SECOND_DIR, { recursive: true })
+    writeFileSync(join(FIRST_DIR, '.env'), 'SECRET=value')
+    writeFileSync(join(FIRST_DIR, '.env.example'), 'SAFE=value')
+    writeFileSync(join(FIRST_DIR, 'nested', '.env.local'), 'LOCAL=value')
+    writeFileSync(join(FIRST_DIR, 'nested', '.env.local.example'), 'SAFE=value')
+    writeFileSync(join(FIRST_DIR, 'nested', 'line\nbreak.env'), 'ODD=value')
+    writeFileSync(join(FIRST_DIR, 'nested', 'choicea.env'), 'CHOICE=value')
+    writeFileSync(join(SECOND_DIR, 'other.env'), 'OTHER=value')
+  })
+
+  afterAll(() => {
+    rmSync(RAW_BASE_DIR, { recursive: true, force: true })
+  })
+
+  it('resolves patterns with shared and distinct roots in one batch', () => {
+    const recursiveEnv = join(FIRST_DIR, '**/.env*')
+    const examples = join(FIRST_DIR, '**/.env.*.example')
+    const otherTree = join(SECOND_DIR, '*.env')
+
+    const results = expandGlobPatterns([recursiveEnv, examples, otherTree])
+
+    expect(results.get(recursiveEnv)).toEqual(
+      expect.arrayContaining([
+        join(FIRST_DIR, '.env'),
+        join(FIRST_DIR, '.env.example'),
+        join(FIRST_DIR, 'nested', '.env.local'),
+        join(FIRST_DIR, 'nested', '.env.local.example'),
+      ]),
+    )
+    expect(results.get(examples)).toEqual([
+      join(FIRST_DIR, 'nested', '.env.local.example'),
+    ])
+    expect(results.get(otherTree)).toEqual([join(SECOND_DIR, 'other.env')])
+  })
+
+  it('preserves spaces and newlines in matched paths', () => {
+    const pattern = join(FIRST_DIR, '**/*.env')
+    const results = expandGlobPatterns([pattern])
+
+    expect(results.get(pattern)).toContain(
+      join(FIRST_DIR, 'nested', 'line\nbreak.env'),
+    )
+  })
+
+  it('preserves exact matching when native name filtering is unsafe', () => {
+    const pattern = join(FIRST_DIR, '**/choice[ab].env')
+    const results = expandGlobPatterns([pattern, pattern])
+
+    expect(results.get(pattern)).toEqual([
+      join(FIRST_DIR, 'nested', 'choicea.env'),
+    ])
+  })
+
+  it('invokes find once for the entire batch', () => {
+    const wrapperDir = join(RAW_BASE_DIR, 'find-wrapper')
+    const invocationLog = join(RAW_BASE_DIR, 'find-invocations')
+    const realFind = spawnSync('which', ['find'], {
+      encoding: 'utf8',
+    }).stdout.trim()
+    mkdirSync(wrapperDir, { recursive: true })
+    writeFileSync(
+      join(wrapperDir, 'find'),
+      `#!/bin/sh\nprintf x >> "$FIND_INVOCATION_LOG"\nexec "${realFind}" "$@"\n`,
+    )
+    chmodSync(join(wrapperDir, 'find'), 0o755)
+
+    const patterns = [
+      join(FIRST_DIR, '**/.env'),
+      join(FIRST_DIR, '**/.env.*'),
+      join(FIRST_DIR, '**/.env*.example'),
+      join(SECOND_DIR, '*.env'),
+    ]
+    const modulePath = join(process.cwd(), 'src/sandbox/sandbox-utils.ts')
+    const child = spawnSync(
+      process.execPath,
+      [
+        '-e',
+        `import { expandGlobPatterns } from ${JSON.stringify(modulePath)}; expandGlobPatterns(${JSON.stringify(patterns)})`,
+      ],
+      {
+        encoding: 'utf8',
+        env: {
+          ...process.env,
+          PATH: `${wrapperDir}:${process.env.PATH ?? ''}`,
+          FIND_INVOCATION_LOG: invocationLog,
+        },
+      },
+    )
+
+    expect(child.stderr).toBe('')
+    expect(child.status).toBe(0)
+    expect(readFileSync(invocationLog, 'utf8')).toBe('x')
+  })
+})
+
 // ============================================================================
 // Tests for globToRegex() after move to sandbox-utils.ts
 // ============================================================================
@@ -235,6 +340,35 @@ describe.if(isLinux)('getFsReadConfig with glob patterns on Linux', () => {
     expect(hasGlob).toBe(false)
     // Should NOT contain non-matching files
     expect(readConfig.denyOnly).not.toContain(join(realTestDir, 'readme.txt'))
+
+    await SandboxManager.reset()
+  })
+
+  it('should batch denyRead and allowRead patterns while preserving both', async () => {
+    const { SandboxManager } = await import(
+      '../../src/sandbox/sandbox-manager.js'
+    )
+    const allowedPath = join(RAW_TEST_DIR, 'allowed.env')
+    writeFileSync(allowedPath, 'SAFE=value')
+
+    await SandboxManager.reset()
+    await SandboxManager.initialize({
+      network: {
+        allowedDomains: [],
+        deniedDomains: [],
+      },
+      filesystem: {
+        denyRead: [join(RAW_TEST_DIR, '*.env')],
+        allowRead: [join(RAW_TEST_DIR, 'allowed.*')],
+        allowWrite: ['/tmp'],
+        denyWrite: [],
+      },
+    })
+
+    const readConfig = SandboxManager.getFsReadConfig()
+    const realAllowedPath = realPath(allowedPath)
+    expect(readConfig.denyOnly).toContain(realAllowedPath)
+    expect(readConfig.allowWithinDeny).toEqual([realAllowedPath])
 
     await SandboxManager.reset()
   })

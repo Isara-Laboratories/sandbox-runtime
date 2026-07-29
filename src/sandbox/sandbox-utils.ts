@@ -1,6 +1,7 @@
 import { homedir } from 'os'
 import * as path from 'path'
 import * as fs from 'fs'
+import { spawnSync } from 'child_process'
 import { getPlatform } from '../utils/platform.js'
 import { logForDebugging } from '../utils/debug.js'
 
@@ -475,68 +476,132 @@ export function globToRegex(globPattern: string): string {
   )
 }
 
-/**
- * Expand a glob pattern into concrete file paths.
- *
- * Used on Linux where bubblewrap doesn't support glob patterns natively.
- * Resolves the static directory prefix, lists files recursively, and filters
- * using globToRegex().
- *
- * @param globPath - A path pattern containing glob characters (e.g., ~/test/*.env)
- * @returns Array of absolute paths matching the glob pattern
- */
-export function expandGlobPattern(globPath: string): string[] {
-  const normalizedPattern = normalizePathForSandbox(globPath)
+interface GlobExpansion {
+  originalPattern: string
+  regex: RegExp
+  baseDir: string
+  namePattern: string | undefined
+}
 
-  // Extract the static directory prefix before any glob characters
+function getGlobExpansion(globPath: string): GlobExpansion | undefined {
+  const normalizedPattern = normalizePathForSandbox(globPath)
   const staticPrefix = normalizedPattern.split(/[*?[\]]/)[0]
   if (!staticPrefix || staticPrefix === '/') {
     logForDebugging(`[Sandbox] Glob pattern too broad, skipping: ${globPath}`)
-    return []
+    return undefined
   }
 
-  // Get the base directory from the static prefix
   const baseDir = staticPrefix.endsWith('/')
     ? staticPrefix.slice(0, -1)
     : path.dirname(staticPrefix)
-
   if (!fs.existsSync(baseDir)) {
     logForDebugging(
       `[Sandbox] Base directory for glob does not exist: ${baseDir}`,
     )
-    return []
+    return undefined
   }
 
-  // Build regex from the normalized glob pattern
-  const regex = new RegExp(globToRegex(normalizedPattern))
+  const regexSource = globToRegex(normalizedPattern)
+  const basenamePattern = path.basename(normalizedPattern)
+  return {
+    originalPattern: globPath,
+    regex: new RegExp(regexSource),
+    baseDir,
+    // find and globToRegex disagree on a few bracket/backslash edge cases.
+    // Do not use those patterns as a native prefilter because a false negative
+    // here would silently omit a sandbox restriction.
+    namePattern: /[\\[\]]/.test(basenamePattern) ? undefined : basenamePattern,
+  }
+}
 
-  // List all entries recursively under the base directory
-  const results: string[] = []
-  try {
-    const entries = fs.readdirSync(baseDir, {
-      recursive: true,
-      withFileTypes: true,
-    })
-
-    for (const entry of entries) {
-      // Build the full path for this entry
-      // entry.parentPath is the directory containing this entry (available in Node 20+/Bun)
-      // For compatibility, fall back to entry.path if parentPath is not available
-      const parentDir =
-        (entry as { parentPath?: string }).parentPath ??
-        (entry as { path?: string }).path ??
-        baseDir
-      const fullPath = path.join(parentDir, entry.name)
-
-      if (regex.test(fullPath)) {
-        results.push(fullPath)
-      }
+function collapseNestedDirectories(directories: string[]): string[] {
+  const roots: string[] = []
+  for (const directory of [...new Set(directories)].sort(
+    (a, b) => a.length - b.length,
+  )) {
+    if (
+      !roots.some(root => {
+        const relative = path.relative(root, directory)
+        return (
+          relative === '' ||
+          (relative !== '..' &&
+            !relative.startsWith(`..${path.sep}`) &&
+            !path.isAbsolute(relative))
+        )
+      })
+    ) {
+      roots.push(directory)
     }
-  } catch (err) {
-    logForDebugging(
-      `[Sandbox] Error expanding glob pattern ${globPath}: ${err}`,
+  }
+  return roots
+}
+
+/**
+ * Expand multiple glob patterns with one native filesystem scan.
+ *
+ * `find` filters by the final path component while traversing each minimal root
+ * once. Results are then checked with globToRegex() so callers retain the same
+ * matching semantics used by the sandbox permission system.
+ */
+export function expandGlobPatterns(
+  globPaths: readonly string[],
+): Map<string, string[]> {
+  const results = new Map<string, string[]>(
+    globPaths.map(pattern => [pattern, []]),
+  )
+  const expansions = [...new Set(globPaths)]
+    .map(getGlobExpansion)
+    .filter((expansion): expansion is GlobExpansion => expansion !== undefined)
+  if (expansions.length === 0) {
+    return results
+  }
+
+  const roots = collapseNestedDirectories(
+    expansions.map(expansion => expansion.baseDir),
+  )
+  const namePatterns = [
+    ...new Set(expansions.map(expansion => expansion.namePattern)),
+  ]
+  const findExpression = namePatterns.includes(undefined)
+    ? []
+    : [
+        '(',
+        ...(namePatterns as string[]).flatMap((namePattern, index) => [
+          ...(index === 0 ? [] : ['-o']),
+          '-name',
+          namePattern,
+        ]),
+        ')',
+      ]
+  const findResult = spawnSync(
+    'find',
+    [...roots, ...findExpression, '-print0'],
+    {
+      encoding: 'buffer',
+      maxBuffer: 1024 * 1024 * 1024,
+    },
+  )
+
+  if (findResult.error || findResult.status !== 0) {
+    const detail = findResult.error?.message ?? findResult.stderr.toString()
+    throw new Error(
+      `Failed to expand sandbox glob patterns with find: ${detail}`,
     )
   }
 
+  for (const matchedPath of findResult.stdout.toString().split('\0')) {
+    if (!matchedPath) continue
+    for (const expansion of expansions) {
+      if (expansion.regex.test(matchedPath)) {
+        results.get(expansion.originalPattern)?.push(matchedPath)
+      }
+    }
+  }
+
   return results
+}
+
+/** Expand one glob pattern into concrete paths. */
+export function expandGlobPattern(globPath: string): string[] {
+  return expandGlobPatterns([globPath]).get(globPath) ?? []
 }
