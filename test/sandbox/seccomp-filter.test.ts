@@ -83,6 +83,24 @@ describe.if(isLinux)('Sandbox Integration', () => {
     expect(wrappedCommand).toContain(real)
   })
 
+  it('passes normalized Unix socket allowlist paths to apply-seccomp', async () => {
+    if (checkLinuxDependencies().errors.length > 0) return
+
+    const real = getApplySeccompBinaryPath()
+    if (!real) return
+
+    const wrappedCommand = await wrapCommandWithSandboxLinux({
+      command: 'echo test',
+      needsNetworkRestriction: false,
+      allowUnixSockets: ['./socket with spaces.sock'],
+      seccompConfig: { applyPath: real },
+    })
+
+    expect(wrappedCommand).toContain('--allow-unix-socket')
+    expect(wrappedCommand).toContain(`${process.cwd()}/socket with spaces.sock`)
+    expect(wrappedCommand).toContain(' -- ')
+  })
+
   it('argv0 mode: builds ARGV0 prefix and uses applyPath verbatim', async () => {
     if (checkLinuxDependencies().errors.length > 0) return
 

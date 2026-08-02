@@ -288,15 +288,15 @@ Uses an **allow-only pattern** - all network access is denied by default.
 
 **Unix Socket Settings** (platform-specific behavior):
 
-| Setting                        | macOS                     | Linux                                    |
-| ------------------------------ | ------------------------- | ---------------------------------------- |
-| `allowUnixSockets: string[]`   | Allowlist of socket paths | _Ignored_ (seccomp can't filter by path) |
-| `allowAllUnixSockets: boolean` | Allow all sockets         | Disable seccomp blocking                 |
+| Setting                        | macOS                     | Linux                              |
+| ------------------------------ | ------------------------- | ---------------------------------- |
+| `allowUnixSockets: string[]`   | Allowlist of socket paths | Exact stream-socket connect paths  |
+| `allowAllUnixSockets: boolean` | Allow all sockets         | Disable seccomp blocking           |
 
 Unix sockets are **blocked by default** on both platforms.
 
 - **macOS**: Use `allowUnixSockets` to allow specific paths (e.g., `["/var/run/docker.sock"]`), or `allowAllUnixSockets: true` to allow all.
-- **Linux**: Blocking uses seccomp filters (x64/arm64 only). If seccomp isn't available, sockets are unrestricted and a warning is shown. Use `allowAllUnixSockets: true` to explicitly disable blocking.
+- **Linux**: Blocking and path-scoped connect mediation use seccomp (x64/arm64 only). Allowlist entries are normalized to exact absolute paths; relative and abstract addresses remain denied. A configured allowlist fails closed if the required binary or kernel features are unavailable. Without an allowlist, a missing seccomp binary retains the existing warning-and-unrestricted fallback. Use `allowAllUnixSockets: true` only to explicitly disable all Unix socket blocking.
 
 #### Filesystem Configuration
 
@@ -580,7 +580,7 @@ $ srt 'echo "bad" > .git/hooks/pre-commit'
 
 ### Unix Socket Restrictions (Linux)
 
-On Linux, the sandbox uses **seccomp BPF (Berkeley Packet Filter)** to block Unix domain socket creation at the syscall level. This provides an additional layer of security to prevent processes from creating new Unix domain sockets for local IPC (unless explicitly allowed).
+On Linux, the sandbox uses **seccomp BPF (Berkeley Packet Filter)** to block Unix domain socket creation by default and to mediate exact stream-socket paths when `allowUnixSockets` is configured.
 
 **How it works:**
 
@@ -588,19 +588,21 @@ On Linux, the sandbox uses **seccomp BPF (Berkeley Packet Filter)** to block Uni
 
 2. **Runtime detection**: The sandbox automatically detects your system's architecture and uses the matching `apply-seccomp` binary.
 
-3. **Syscall filtering**: The BPF filter intercepts the `socket()` syscall and blocks creation of `AF_UNIX` sockets by returning `EPERM`. This prevents sandboxed code from creating new Unix domain sockets.
+3. **Default filtering**: Without an allowlist, the BPF filter blocks `socket(AF_UNIX, ...)` with `EPERM`.
 
-4. **Two-stage application using apply-seccomp binary**:
+4. **Path allowlisting**: With an allowlist, the filter permits Unix stream socket creation, keeps datagram and other Unix socket types blocked, and sends every `connect()` to a seccomp user-notification supervisor. The supervisor copies the tracee address, duplicates its descriptor with `pidfd_getfd`, validates an absolute pathname against the allowlist, and performs `connect()` itself. It never returns `SECCOMP_USER_NOTIF_FLAG_CONTINUE`, avoiding the tracee-memory race that would result from inspecting a path and then asking the tracee to retry the original syscall.
+
+5. **Two-stage application using apply-seccomp binary**:
    - Outer bwrap creates the sandbox with filesystem, network, and PID namespace restrictions
    - Network bridging processes (socat) start inside the sandbox (need Unix sockets)
    - apply-seccomp creates a nested user+PID+mount namespace and remounts `/proc`
    - Inside the nested namespace, apply-seccomp acts as PID 1 (non-dumpable init/reaper)
-   - apply-seccomp forks, applies the seccomp filter via `prctl()`, and execs the user command
-   - User command runs with all sandbox restrictions plus Unix socket creation blocking
+   - apply-seccomp forks, applies the selected filter, and execs the user command
+   - In allowlist mode, the unfiltered outer stub supervises trapped connects
 
 **PID namespace isolation**: The nested PID namespace ensures the user command cannot see or address any process that runs without the seccomp filter (bwrap's init, the shell wrapper, or the socat helpers). This keeps the seccomp boundary intact regardless of `kernel.yama.ptrace_scope`, since unfiltered helpers are not reachable via `ptrace` or `/proc/N/mem`. The inner PID 1 sets `PR_SET_DUMPABLE=0` so it is not ptraceable either. If nested namespace creation fails, apply-seccomp aborts rather than running without isolation.
 
-**Security limitations**: The filter blocks `socket(AF_UNIX, ...)` and the `io_uring_setup`/`io_uring_enter`/`io_uring_register` syscalls (the latter three because `IORING_OP_SOCKET` on Linux 5.19+ would otherwise bypass the `socket()` rule). It does not prevent operations on Unix socket file descriptors inherited from parent processes or passed via `SCM_RIGHTS`. For most sandboxing scenarios, blocking socket creation is sufficient to prevent unauthorized IPC.
+**Security limitations**: Both modes block the `io_uring_setup`/`io_uring_enter`/`io_uring_register` syscalls because `IORING_OP_SOCKET` and related operations would otherwise bypass the ordinary syscall rules. Default mode does not prevent operations on Unix socket descriptors inherited from parent processes or passed via `SCM_RIGHTS`. Allowlist mode mediates `connect()` even for inherited descriptors, but does not prevent purely in-process Unix `socketpair()` communication.
 
 **Zero runtime dependencies**: Pre-built static apply-seccomp binaries and pre-generated BPF filters are included for x64 and arm64 architectures. No compilation tools or external dependencies required at runtime.
 

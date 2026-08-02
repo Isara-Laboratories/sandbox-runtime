@@ -51,12 +51,17 @@ run([
   '-lseccomp',
 ])
 
-const bpf: Record<string, Buffer> = {}
+const blockedBpf: Record<string, Buffer> = {}
+const allowlistBpf: Record<string, Buffer> = {}
 for (const target of ['x86_64', 'aarch64']) {
-  const tmp = join(OUT, target + '.bpf')
-  run([gen, tmp, target])
-  bpf[target] = readFileSync(tmp)
-  rmSync(tmp)
+  const blockedTmp = join(OUT, target + '-blocked.bpf')
+  const allowlistTmp = join(OUT, target + '-allowlist.bpf')
+  run([gen, blockedTmp, 'block', target])
+  run([gen, allowlistTmp, 'allowlist', target])
+  blockedBpf[target] = readFileSync(blockedTmp)
+  allowlistBpf[target] = readFileSync(allowlistTmp)
+  rmSync(blockedTmp)
+  rmSync(allowlistTmp)
 }
 rmSync(gen)
 
@@ -65,11 +70,17 @@ writeFileSync(
   header,
   '#if defined(__x86_64__)\n' +
     'static const unsigned char unix_block_bpf[] = {\n' +
-    toCArray(bpf.x86_64) +
+    toCArray(blockedBpf.x86_64) +
+    '\n};\n' +
+    'static const unsigned char unix_allowlist_bpf[] = {\n' +
+    toCArray(allowlistBpf.x86_64) +
     '\n};\n' +
     '#elif defined(__aarch64__)\n' +
     'static const unsigned char unix_block_bpf[] = {\n' +
-    toCArray(bpf.aarch64) +
+    toCArray(blockedBpf.aarch64) +
+    '\n};\n' +
+    'static const unsigned char unix_allowlist_bpf[] = {\n' +
+    toCArray(allowlistBpf.aarch64) +
     '\n};\n' +
     '#else\n' +
     '#error "unsupported architecture for unix-block BPF filter"\n' +

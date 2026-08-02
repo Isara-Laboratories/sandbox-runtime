@@ -42,6 +42,7 @@ export interface LinuxSandboxParams {
   readConfig?: FsReadRestrictionConfig
   writeConfig?: FsWriteRestrictionConfig
   enableWeakerNestedSandbox?: boolean
+  allowUnixSockets?: string[]
   allowAllUnixSockets?: boolean
   binShell?: string
   ripgrepConfig?: { command: string; args?: string[] }
@@ -599,15 +600,47 @@ export async function initializeLinuxNetworkBridge(
 function resolveApplySeccompPrefix(
   applyPath: string | undefined,
   argv0: string | undefined,
+  allowUnixSockets: string[],
 ): string | undefined {
+  const policyArgs = allowUnixSockets.flatMap(socketPath => [
+    '--allow-unix-socket',
+    socketPath,
+  ])
+  if (policyArgs.length > 0) {
+    policyArgs.push('--')
+  }
+
   if (argv0) {
     if (!applyPath) {
       throw new Error('seccompConfig.argv0 requires seccompConfig.applyPath')
     }
-    return `ARGV0=${shellquote.quote([argv0])} ${shellquote.quote([applyPath])} `
+    return `ARGV0=${shellquote.quote([argv0])} ${shellquote.quote([applyPath, ...policyArgs])} `
   }
   const binary = getApplySeccompBinaryPath(applyPath)
-  return binary ? `${shellquote.quote([binary])} ` : undefined
+  if (!binary) {
+    if (allowUnixSockets.length > 0) {
+      throw new Error(
+        'apply-seccomp with USER_NOTIF support is required for Linux allowUnixSockets',
+      )
+    }
+    return undefined
+  }
+  return `${shellquote.quote([binary, ...policyArgs])} `
+}
+
+function normalizeUnixSocketAllowlist(socketPaths: string[]): string[] {
+  return socketPaths.map(socketPath => {
+    const normalized = normalizePathForSandbox(socketPath)
+    if (!path.isAbsolute(normalized) || /[*?[\]]/.test(normalized)) {
+      throw new Error(
+        `Linux allowUnixSockets entries must resolve to exact absolute paths: ${socketPath}`,
+      )
+    }
+    if (normalized.includes('\0')) {
+      throw new Error('Linux allowUnixSockets entries cannot contain NUL bytes')
+    }
+    return normalized
+  })
 }
 
 /**
@@ -976,9 +1009,11 @@ async function generateFilesystemArgs(
 /**
  * Wrap a command with sandbox restrictions on Linux
  *
- * UNIX SOCKET BLOCKING (APPLY-SECCOMP):
- * This implementation uses a custom apply-seccomp binary to block Unix domain socket
- * creation for user commands while allowing network infrastructure:
+ * UNIX SOCKET POLICY (APPLY-SECCOMP):
+ * This implementation uses a custom apply-seccomp binary after the unfiltered
+ * socat helpers have started. Without an allowlist it blocks AF_UNIX socket
+ * creation. With allowUnixSockets it allows Unix stream socket creation and
+ * traps connect() for supervisor-side path enforcement.
  *
  * Stage 1: Outer bwrap - Network and filesystem isolation (NO seccomp)
  *   - Bubblewrap starts with isolated network namespace (--unshare-net)
@@ -989,34 +1024,23 @@ async function generateFilesystemArgs(
  * Stage 2: apply-seccomp - Nested PID namespace + seccomp filter
  *   - apply-seccomp creates a nested user+PID+mount namespace and remounts /proc
  *   - Inside, apply-seccomp becomes PID 1 (non-dumpable init/reaper)
- *   - Forks, sets PR_SET_NO_NEW_PRIVS, applies seccomp via prctl(PR_SET_SECCOMP)
- *   - Execs user command with seccomp active (cannot create new Unix sockets)
+ *   - Forks, sets PR_SET_NO_NEW_PRIVS, and installs the selected seccomp filter
+ *   - For an allowlist, sends the USER_NOTIF listener to the unfiltered supervisor
  *   - User command cannot see or ptrace bwrap/bash/socat (separate PID namespace)
  *
- * This solves the conflict between:
- * - Security: Blocking arbitrary Unix socket creation in user commands
- * - Functionality: Network sandboxing requires socat to call socket(AF_UNIX, ...) for bridge connections
- *
- * The seccomp-bpf filter blocks socket(AF_UNIX, ...) syscalls, preventing:
- * - Creating new Unix domain socket file descriptors
- *
- * Security limitations:
- * - Does NOT block operations (bind, connect, sendto, etc.) on inherited Unix socket FDs
- * - Does NOT prevent passing Unix socket FDs via SCM_RIGHTS
- * - For most sandboxing use cases, blocking socket creation is sufficient
- *
- * The filter allows:
- * - All TCP/UDP sockets (AF_INET, AF_INET6) for normal network operations
- * - All other syscalls
- *
- * PLATFORM NOTE:
- * The allowUnixSockets configuration is not path-based on Linux (unlike macOS)
- * because seccomp-bpf cannot inspect user-space memory to read socket paths.
+ * The supervisor copies the sockaddr from tracee memory, duplicates the exact
+ * tracee descriptor with pidfd_getfd, validates Unix stream paths against the
+ * absolute allowlist, and performs connect() itself. It never returns
+ * SECCOMP_USER_NOTIF_FLAG_CONTINUE, so tracee-controlled address memory cannot
+ * be changed between policy validation and the kernel operation. Relative,
+ * abstract, datagram, and non-allowlisted Unix sockets remain denied. io_uring
+ * remains blocked because its socket operations bypass ordinary syscall traps.
  *
  * Requirements for seccomp filtering:
  * - Pre-built apply-seccomp binaries are included for x64 and ARM64
  * - Pre-generated BPF filters are included for x64 and ARM64
  * - Other architectures are not currently supported (no apply-seccomp binary available)
+ * - Path-scoped allowlists fail closed when the binary or kernel features are unavailable
  * - To use sandboxing without Unix socket blocking on unsupported architectures,
  *   set allowAllUnixSockets: true in your configuration
  * Dependencies are checked by checkLinuxDependencies() before enabling the sandbox.
@@ -1034,6 +1058,7 @@ export async function wrapCommandWithSandboxLinux(
     readConfig,
     writeConfig,
     enableWeakerNestedSandbox,
+    allowUnixSockets = [],
     allowAllUnixSockets,
     binShell,
     ripgrepConfig = { command: 'rg' },
@@ -1048,12 +1073,15 @@ export async function wrapCommandWithSandboxLinux(
   // Write: allowOnly pattern - undefined means no restrictions, any config means restrictions
   const hasReadRestrictions = readConfig && readConfig.denyOnly.length > 0
   const hasWriteRestrictions = writeConfig !== undefined
+  const hasUnixSocketAllowlist =
+    !allowAllUnixSockets && allowUnixSockets.length > 0
 
   // Check if we need any sandboxing
   if (
     !needsNetworkRestriction &&
     !hasReadRestrictions &&
-    !hasWriteRestrictions
+    !hasWriteRestrictions &&
+    !hasUnixSocketAllowlist
   ) {
     return command
   }
@@ -1074,9 +1102,12 @@ export async function wrapCommandWithSandboxLinux(
     // apply-seccomp wraps the workload and applies the baked-in BPF filter
     // that blocks socket(AF_UNIX, ...). Skipped when allowAllUnixSockets is true.
     if (!allowAllUnixSockets) {
+      const normalizedUnixSockets =
+        normalizeUnixSocketAllowlist(allowUnixSockets)
       applySeccompPrefix = resolveApplySeccompPrefix(
         seccompConfig?.applyPath,
         seccompConfig?.argv0,
+        normalizedUnixSockets,
       )
 
       if (!applySeccompPrefix) {
@@ -1087,7 +1118,9 @@ export async function wrapCommandWithSandboxLinux(
         )
       } else {
         logForDebugging(
-          '[Sandbox Linux] Applying seccomp filter for Unix socket blocking',
+          normalizedUnixSockets.length > 0
+            ? '[Sandbox Linux] Applying path-scoped Unix socket connect policy'
+            : '[Sandbox Linux] Applying seccomp filter for Unix socket blocking',
         )
       }
     } else {
@@ -1239,7 +1272,13 @@ export async function wrapCommandWithSandboxLinux(
     if (needsNetworkRestriction) restrictions.push('network')
     if (hasReadRestrictions || hasWriteRestrictions)
       restrictions.push('filesystem')
-    if (applySeccompPrefix) restrictions.push('seccomp(unix-block)')
+    if (applySeccompPrefix) {
+      restrictions.push(
+        hasUnixSocketAllowlist
+          ? 'seccomp(unix-allowlist)'
+          : 'seccomp(unix-block)',
+      )
+    }
 
     logForDebugging(
       `[Sandbox Linux] Wrapped command with bwrap (${restrictions.join(', ')} restrictions)`,

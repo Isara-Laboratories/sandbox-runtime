@@ -118,7 +118,7 @@ export const NetworkConfigSchema = z.object({
     .array(z.string())
     .optional()
     .describe(
-      'macOS only: Unix socket paths to allow. Ignored on Linux (seccomp cannot filter by path).',
+      'Exact Unix socket paths to allow. Linux supports absolute stream-socket connect paths only.',
     ),
   allowAllUnixSockets: z
     .boolean()
