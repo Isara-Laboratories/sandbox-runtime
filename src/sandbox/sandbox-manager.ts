@@ -689,6 +689,7 @@ async function wrapWithSandbox(
         readConfig,
         writeConfig,
         enableWeakerNestedSandbox: getEnableWeakerNestedSandbox(),
+        allowUnixSockets: getAllowUnixSockets(),
         allowAllUnixSockets: getAllowAllUnixSockets(),
         binShell,
         ripgrepConfig: getRipgrepConfig(),

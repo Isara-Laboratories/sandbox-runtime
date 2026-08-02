@@ -1,10 +1,9 @@
 /*
- * Seccomp BPF filter generator to block Unix domain socket creation
+ * Seccomp BPF filter generator for Linux Unix socket policy
  *
- * This program generates a seccomp-bpf filter that blocks the socket() syscall
- * when called with AF_UNIX as the domain argument. This prevents creation of
- * Unix domain sockets while allowing all other socket types (AF_INET, AF_INET6, etc.)
- * and all other syscalls.
+ * Block mode denies socket(AF_UNIX). Allowlist mode permits Unix stream socket
+ * creation, denies other Unix socket types, and sends connect() to a USER_NOTIF
+ * supervisor for exact-path validation and safe emulation.
  *
  * The filter is exported in a format compatible with bubblewrap's --seccomp flag.
  *
@@ -27,7 +26,7 @@
  *   gcc -o seccomp-unix-block seccomp-unix-block.c -lseccomp
  *
  * Usage:
- *   ./seccomp-unix-block <output-file> [arch]
+ *   ./seccomp-unix-block <output-file> <block|allowlist> [arch]
  *
  * If arch is given (x86_64 or aarch64), the filter is generated for that
  * architecture instead of the native one. Lets a single-arch builder emit
@@ -48,17 +47,81 @@
 #include <sys/stat.h>
 #include <sys/types.h>
 
+static int add_io_uring_rules(scmp_filter_ctx ctx) {
+    int io_uring_calls[] = {
+        SCMP_SYS(io_uring_setup),
+        SCMP_SYS(io_uring_enter),
+        SCMP_SYS(io_uring_register),
+    };
+    for (size_t i = 0; i < sizeof(io_uring_calls) / sizeof(io_uring_calls[0]); i++) {
+        int rc = seccomp_rule_add(ctx, SCMP_ACT_ERRNO(EPERM), io_uring_calls[i], 0);
+        if (rc < 0) {
+            fprintf(stderr, "Error: Failed to add io_uring rule: %s\n", strerror(-rc));
+            return rc;
+        }
+    }
+    return 0;
+}
+
+static int add_allowlist_rules(scmp_filter_ctx ctx) {
+    /* Path policy needs userspace memory, so connect() is handled by the
+     * apply-seccomp USER_NOTIF supervisor. The supervisor emulates the call
+     * from a copied sockaddr and never returns CONTINUE. */
+    int rc = seccomp_rule_add(ctx, SCMP_ACT_NOTIFY, SCMP_SYS(connect), 0);
+    if (rc < 0) {
+        fprintf(stderr, "Error: Failed to add connect notify rule: %s\n", strerror(-rc));
+        return rc;
+    }
+
+    /* Only AF_UNIX stream sockets are useful for a path-scoped connect
+     * allowlist. Block every other valid Unix socket type at creation time.
+     * SOCK_CLOEXEC and SOCK_NONBLOCK live outside the low type mask. */
+    const int socket_type_mask = 0x0f;
+    const int blocked_types[] = {
+        SOCK_DGRAM,
+        SOCK_RAW,
+        SOCK_RDM,
+        SOCK_SEQPACKET,
+#ifdef SOCK_DCCP
+        SOCK_DCCP,
+#endif
+#ifdef SOCK_PACKET
+        SOCK_PACKET,
+#endif
+    };
+    for (size_t i = 0; i < sizeof(blocked_types) / sizeof(blocked_types[0]); i++) {
+        rc = seccomp_rule_add(
+            ctx,
+            SCMP_ACT_ERRNO(EPERM),
+            SCMP_SYS(socket),
+            2,
+            SCMP_A0(SCMP_CMP_MASKED_EQ, 0xffffffff, AF_UNIX),
+            SCMP_A1(SCMP_CMP_MASKED_EQ, socket_type_mask, blocked_types[i])
+        );
+        if (rc < 0) {
+            fprintf(stderr, "Error: Failed to add Unix socket type rule: %s\n", strerror(-rc));
+            return rc;
+        }
+    }
+    return 0;
+}
+
 int main(int argc, char *argv[]) {
     scmp_filter_ctx ctx;
     int rc;
 
-    if (argc < 2 || argc > 3) {
-        fprintf(stderr, "Usage: %s <output-file> [x86_64|aarch64]\n", argv[0]);
+    if (argc < 3 || argc > 4) {
+        fprintf(stderr, "Usage: %s <output-file> <block|allowlist> [x86_64|aarch64]\n", argv[0]);
         return 1;
     }
 
     const char *output_file = argv[1];
-    const char *arch_name = (argc == 3) ? argv[2] : NULL;
+    const char *mode = argv[2];
+    const char *arch_name = (argc == 4) ? argv[3] : NULL;
+    if (strcmp(mode, "block") != 0 && strcmp(mode, "allowlist") != 0) {
+        fprintf(stderr, "Error: Unsupported mode '%s'\n", mode);
+        return 1;
+    }
 
     /* Create seccomp context with default action ALLOW */
     ctx = seccomp_init(SCMP_ACT_ALLOW);
@@ -89,17 +152,15 @@ int main(int argc, char *argv[]) {
         }
     }
 
-    /* Add rule to block socket(AF_UNIX, ...) */
-    /* socket() syscall signature: int socket(int domain, int type, int protocol) */
-    /* arg0 = domain (AF_UNIX = 1) */
-    /* Use SCMP_CMP_MASKED_EQ with a 32-bit mask: the domain argument is a 32-bit
-     * int, so the kernel ignores the upper 32 bits of the register. A plain
-     * SCMP_CMP_EQ would compare all 64 bits and miss calls where the upper bits
-     * are set. */
-    rc = seccomp_rule_add(ctx, SCMP_ACT_ERRNO(EPERM), SCMP_SYS(socket), 1,
-                          SCMP_A0(SCMP_CMP_MASKED_EQ, 0xffffffff, AF_UNIX));
+    if (strcmp(mode, "block") == 0) {
+        /* Use a 32-bit mask because socket()'s domain argument is an int and
+         * the kernel ignores the upper half of the syscall register. */
+        rc = seccomp_rule_add(ctx, SCMP_ACT_ERRNO(EPERM), SCMP_SYS(socket), 1,
+                              SCMP_A0(SCMP_CMP_MASKED_EQ, 0xffffffff, AF_UNIX));
+    } else {
+        rc = add_allowlist_rules(ctx);
+    }
     if (rc < 0) {
-        fprintf(stderr, "Error: Failed to add seccomp rule: %s\n", strerror(-rc));
         seccomp_release(ctx);
         return 1;
     }
@@ -110,18 +171,10 @@ int main(int argc, char *argv[]) {
      * shared-memory ring), so the only safe option is to deny ring creation
      * and use. Blocking all three syscalls also covers the case of an
      * inherited ring fd. */
-    int io_uring_calls[] = {
-        SCMP_SYS(io_uring_setup),
-        SCMP_SYS(io_uring_enter),
-        SCMP_SYS(io_uring_register),
-    };
-    for (size_t i = 0; i < sizeof(io_uring_calls) / sizeof(io_uring_calls[0]); i++) {
-        rc = seccomp_rule_add(ctx, SCMP_ACT_ERRNO(EPERM), io_uring_calls[i], 0);
-        if (rc < 0) {
-            fprintf(stderr, "Error: Failed to add io_uring rule: %s\n", strerror(-rc));
-            seccomp_release(ctx);
-            return 1;
-        }
+    rc = add_io_uring_rules(ctx);
+    if (rc < 0) {
+        seccomp_release(ctx);
+        return 1;
     }
 
     /* Export the filter to a file */
