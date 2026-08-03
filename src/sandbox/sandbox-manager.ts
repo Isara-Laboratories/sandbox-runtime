@@ -403,33 +403,70 @@ function checkDependencies(ripgrepConfig?: {
   return { errors, warnings }
 }
 
-function expandFsReadConfig(
-  denyRead: readonly string[],
-  allowRead: readonly string[],
-): FsReadRestrictionConfig {
-  const readPatterns = [...denyRead, ...allowRead]
-  const globPatterns = readPatterns.filter(p => {
-    const stripped = removeTrailingGlobSuffix(p)
-    return getPlatform() === 'linux' && containsGlobChars(stripped)
+type FilesystemPolicyKind =
+  | 'denyRead'
+  | 'allowRead'
+  | 'allowWrite'
+  | 'denyWrite'
+
+interface FilesystemPolicyPaths {
+  denyRead: readonly string[]
+  allowRead: readonly string[]
+  allowWrite: readonly string[]
+  denyWrite: readonly string[]
+}
+
+interface ExpandedFilesystemPolicy {
+  readConfig: FsReadRestrictionConfig
+  writeConfig: FsWriteRestrictionConfig
+}
+
+function expandFilesystemPolicy(
+  policy: FilesystemPolicyPaths,
+): ExpandedFilesystemPolicy {
+  const platform = getPlatform()
+  // Linux expansion traverses every minimal policy root. Collect every policy
+  // list before expanding so one command preparation performs one traversal.
+  const policyPaths = [
+    ...policy.denyRead,
+    ...policy.allowRead,
+    ...policy.allowWrite,
+    ...policy.denyWrite,
+  ]
+  const globPatterns = policyPaths.filter(path => {
+    const stripped = removeTrailingGlobSuffix(path)
+    return platform === 'linux' && containsGlobChars(stripped)
   })
   const expandedGlobs = expandGlobPatterns(globPatterns)
 
-  const expandPaths = (paths: readonly string[], kind: string): string[] =>
-    paths.flatMap(p => {
-      const stripped = removeTrailingGlobSuffix(p)
-      if (getPlatform() !== 'linux' || !containsGlobChars(stripped)) {
+  const expandPaths = (
+    paths: readonly string[],
+    kind: FilesystemPolicyKind,
+  ): string[] =>
+    paths.flatMap(path => {
+      const stripped = removeTrailingGlobSuffix(path)
+      if (platform !== 'linux' || !containsGlobChars(stripped)) {
         return [stripped]
       }
-      const expanded = expandedGlobs.get(p) ?? []
+      const expanded = expandedGlobs.get(path) ?? []
       logForDebugging(
-        `[Sandbox] Expanded ${kind} glob pattern "${p}" to ${expanded.length} paths on Linux`,
+        `[Sandbox] Expanded ${kind} glob pattern "${path}" to ${expanded.length} paths on Linux`,
       )
       return expanded
     })
 
   return {
-    denyOnly: expandPaths(denyRead, 'denyRead'),
-    allowWithinDeny: expandPaths(allowRead, 'allowRead'),
+    readConfig: {
+      denyOnly: expandPaths(policy.denyRead, 'denyRead'),
+      allowWithinDeny: expandPaths(policy.allowRead, 'allowRead'),
+    },
+    writeConfig: {
+      allowOnly: [
+        ...getDefaultWritePaths(),
+        ...expandPaths(policy.allowWrite, 'allowWrite'),
+      ],
+      denyWithinAllow: expandPaths(policy.denyWrite, 'denyWrite'),
+    },
   }
 }
 
@@ -437,50 +474,12 @@ function getFsReadConfig(): FsReadRestrictionConfig {
   if (!config) {
     return { denyOnly: [], allowWithinDeny: [] }
   }
-  return expandFsReadConfig(
-    config.filesystem.denyRead,
-    config.filesystem.allowRead ?? [],
-  )
-}
-
-function expandFsWriteConfig(
-  allowWrite: readonly string[],
-  denyWrite: readonly string[],
-): FsWriteRestrictionConfig {
-  const platform = getPlatform()
-
-  // Bubblewrap cannot grant writes through glob patterns.
-  const allowPaths = allowWrite
-    .map(path => removeTrailingGlobSuffix(path))
-    .filter(path => {
-      if (platform === 'linux' && containsGlobChars(path)) {
-        logForDebugging(`Skipping glob pattern on Linux/WSL: ${path}`)
-        return false
-      }
-      return true
-    })
-
-  const globPatterns = denyWrite.filter(path => {
-    const stripped = removeTrailingGlobSuffix(path)
-    return platform === 'linux' && containsGlobChars(stripped)
-  })
-  const expandedGlobs = expandGlobPatterns(globPatterns)
-  const denyPaths = denyWrite.flatMap(path => {
-    const stripped = removeTrailingGlobSuffix(path)
-    if (platform !== 'linux' || !containsGlobChars(stripped)) {
-      return [stripped]
-    }
-    const expanded = expandedGlobs.get(path) ?? []
-    logForDebugging(
-      `[Sandbox] Expanded denyWrite glob pattern "${path}" to ${expanded.length} paths on Linux`,
-    )
-    return expanded
-  })
-
-  return {
-    allowOnly: [...getDefaultWritePaths(), ...allowPaths],
-    denyWithinAllow: denyPaths,
-  }
+  return expandFilesystemPolicy({
+    denyRead: config.filesystem.denyRead,
+    allowRead: config.filesystem.allowRead ?? [],
+    allowWrite: config.filesystem.allowWrite,
+    denyWrite: config.filesystem.denyWrite,
+  }).readConfig
 }
 
 function getFsWriteConfig(): FsWriteRestrictionConfig {
@@ -488,10 +487,12 @@ function getFsWriteConfig(): FsWriteRestrictionConfig {
     return { allowOnly: getDefaultWritePaths(), denyWithinAllow: [] }
   }
 
-  return expandFsWriteConfig(
-    config.filesystem.allowWrite,
-    config.filesystem.denyWrite,
-  )
+  return expandFilesystemPolicy({
+    denyRead: config.filesystem.denyRead,
+    allowRead: config.filesystem.allowRead ?? [],
+    allowWrite: config.filesystem.allowWrite,
+    denyWrite: config.filesystem.denyWrite,
+  }).writeConfig
 }
 
 function getNetworkRestrictionConfig(): NetworkRestrictionConfig {
@@ -599,14 +600,18 @@ async function wrapWithSandbox(
   // If neither exists, defaults to empty arrays (most restrictive)
   // Always include default system write paths (like /dev/null, /tmp/claude)
   //
-  const writeConfig = expandFsWriteConfig(
-    customConfig?.filesystem?.allowWrite ?? config?.filesystem.allowWrite ?? [],
-    customConfig?.filesystem?.denyWrite ?? config?.filesystem.denyWrite ?? [],
-  )
-  const readConfig = expandFsReadConfig(
-    customConfig?.filesystem?.denyRead ?? config?.filesystem.denyRead ?? [],
-    customConfig?.filesystem?.allowRead ?? config?.filesystem.allowRead ?? [],
-  )
+  const { readConfig, writeConfig } = expandFilesystemPolicy({
+    denyRead:
+      customConfig?.filesystem?.denyRead ?? config?.filesystem.denyRead ?? [],
+    allowRead:
+      customConfig?.filesystem?.allowRead ?? config?.filesystem.allowRead ?? [],
+    allowWrite:
+      customConfig?.filesystem?.allowWrite ??
+      config?.filesystem.allowWrite ??
+      [],
+    denyWrite:
+      customConfig?.filesystem?.denyWrite ?? config?.filesystem.denyWrite ?? [],
+  })
 
   // Check if network config is specified - this determines if we need network restrictions
   // Network restriction is needed when:
@@ -938,38 +943,9 @@ function annotateStderrWithSandboxFailures(
   return annotated
 }
 
-/**
- * Returns glob patterns from Edit/Read permission rules that are not
- * fully supported on Linux. Returns empty array on macOS or when
- * sandboxing is disabled.
- *
- * Patterns ending with /** are excluded since they work as subpaths.
- */
+/** Return filesystem glob patterns that are not fully supported on Linux. */
 function getLinuxGlobPatternWarnings(): string[] {
-  // Only warn on Linux/WSL (bubblewrap doesn't support globs)
-  // macOS supports glob patterns via regex conversion
-  if (getPlatform() !== 'linux' || !config) {
-    return []
-  }
-
-  const globPatterns: string[] = []
-
-  // Check filesystem paths for glob patterns
-  // denyRead and denyWrite are excluded because their globs are expanded to
-  // concrete paths on Linux.
-  const allPaths = config.filesystem.allowWrite
-
-  for (const path of allPaths) {
-    // Strip trailing /** since that's just a subpath (directory and everything under it)
-    const pathWithoutTrailingStar = removeTrailingGlobSuffix(path)
-
-    // Only warn if there are still glob characters after removing trailing /**
-    if (containsGlobChars(pathWithoutTrailingStar)) {
-      globPatterns.push(path)
-    }
-  }
-
-  return globPatterns
+  return []
 }
 
 // ============================================================================
