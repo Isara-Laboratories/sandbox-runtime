@@ -403,59 +403,46 @@ function checkDependencies(ripgrepConfig?: {
   return { errors, warnings }
 }
 
-function expandFsReadConfig(
-  denyRead: readonly string[],
-  allowRead: readonly string[],
-): FsReadRestrictionConfig {
-  const readPatterns = [...denyRead, ...allowRead]
-  const globPatterns = readPatterns.filter(p => {
-    const stripped = removeTrailingGlobSuffix(p)
-    return getPlatform() === 'linux' && containsGlobChars(stripped)
-  })
-  const expandedGlobs = expandGlobPatterns(globPatterns)
+type FilesystemPolicyKind =
+  | 'denyRead'
+  | 'allowRead'
+  | 'allowWrite'
+  | 'denyWrite'
 
-  const expandPaths = (paths: readonly string[], kind: string): string[] =>
-    paths.flatMap(p => {
-      const stripped = removeTrailingGlobSuffix(p)
-      if (getPlatform() !== 'linux' || !containsGlobChars(stripped)) {
-        return [stripped]
-      }
-      const expanded = expandedGlobs.get(p) ?? []
-      logForDebugging(
-        `[Sandbox] Expanded ${kind} glob pattern "${p}" to ${expanded.length} paths on Linux`,
-      )
-      return expanded
-    })
-
-  return {
-    denyOnly: expandPaths(denyRead, 'denyRead'),
-    allowWithinDeny: expandPaths(allowRead, 'allowRead'),
-  }
+interface FilesystemPolicyPaths {
+  denyRead: readonly string[]
+  allowRead: readonly string[]
+  allowWrite: readonly string[]
+  denyWrite: readonly string[]
 }
 
-function getFsReadConfig(): FsReadRestrictionConfig {
-  if (!config) {
-    return { denyOnly: [], allowWithinDeny: [] }
-  }
-  return expandFsReadConfig(
-    config.filesystem.denyRead,
-    config.filesystem.allowRead ?? [],
-  )
+interface ExpandedFilesystemPolicy {
+  readConfig: FsReadRestrictionConfig
+  writeConfig: FsWriteRestrictionConfig
 }
 
-function expandFsWriteConfig(
-  allowWrite: readonly string[],
-  denyWrite: readonly string[],
-): FsWriteRestrictionConfig {
+function expandFilesystemPolicy(
+  policy: FilesystemPolicyPaths,
+): ExpandedFilesystemPolicy {
   const platform = getPlatform()
-  const writePatterns = [...allowWrite, ...denyWrite]
-  const globPatterns = writePatterns.filter(path => {
+  // Linux expansion traverses every minimal policy root. Collect every policy
+  // list before expanding so one command preparation performs one traversal.
+  const policyPaths = [
+    ...policy.denyRead,
+    ...policy.allowRead,
+    ...policy.allowWrite,
+    ...policy.denyWrite,
+  ]
+  const globPatterns = policyPaths.filter(path => {
     const stripped = removeTrailingGlobSuffix(path)
     return platform === 'linux' && containsGlobChars(stripped)
   })
   const expandedGlobs = expandGlobPatterns(globPatterns)
 
-  const expandPaths = (paths: readonly string[], kind: string): string[] =>
+  const expandPaths = (
+    paths: readonly string[],
+    kind: FilesystemPolicyKind,
+  ): string[] =>
     paths.flatMap(path => {
       const stripped = removeTrailingGlobSuffix(path)
       if (platform !== 'linux' || !containsGlobChars(stripped)) {
@@ -469,12 +456,30 @@ function expandFsWriteConfig(
     })
 
   return {
-    allowOnly: [
-      ...getDefaultWritePaths(),
-      ...expandPaths(allowWrite, 'allowWrite'),
-    ],
-    denyWithinAllow: expandPaths(denyWrite, 'denyWrite'),
+    readConfig: {
+      denyOnly: expandPaths(policy.denyRead, 'denyRead'),
+      allowWithinDeny: expandPaths(policy.allowRead, 'allowRead'),
+    },
+    writeConfig: {
+      allowOnly: [
+        ...getDefaultWritePaths(),
+        ...expandPaths(policy.allowWrite, 'allowWrite'),
+      ],
+      denyWithinAllow: expandPaths(policy.denyWrite, 'denyWrite'),
+    },
   }
+}
+
+function getFsReadConfig(): FsReadRestrictionConfig {
+  if (!config) {
+    return { denyOnly: [], allowWithinDeny: [] }
+  }
+  return expandFilesystemPolicy({
+    denyRead: config.filesystem.denyRead,
+    allowRead: config.filesystem.allowRead ?? [],
+    allowWrite: config.filesystem.allowWrite,
+    denyWrite: config.filesystem.denyWrite,
+  }).readConfig
 }
 
 function getFsWriteConfig(): FsWriteRestrictionConfig {
@@ -482,10 +487,12 @@ function getFsWriteConfig(): FsWriteRestrictionConfig {
     return { allowOnly: getDefaultWritePaths(), denyWithinAllow: [] }
   }
 
-  return expandFsWriteConfig(
-    config.filesystem.allowWrite,
-    config.filesystem.denyWrite,
-  )
+  return expandFilesystemPolicy({
+    denyRead: config.filesystem.denyRead,
+    allowRead: config.filesystem.allowRead ?? [],
+    allowWrite: config.filesystem.allowWrite,
+    denyWrite: config.filesystem.denyWrite,
+  }).writeConfig
 }
 
 function getNetworkRestrictionConfig(): NetworkRestrictionConfig {
@@ -593,14 +600,18 @@ async function wrapWithSandbox(
   // If neither exists, defaults to empty arrays (most restrictive)
   // Always include default system write paths (like /dev/null, /tmp/claude)
   //
-  const writeConfig = expandFsWriteConfig(
-    customConfig?.filesystem?.allowWrite ?? config?.filesystem.allowWrite ?? [],
-    customConfig?.filesystem?.denyWrite ?? config?.filesystem.denyWrite ?? [],
-  )
-  const readConfig = expandFsReadConfig(
-    customConfig?.filesystem?.denyRead ?? config?.filesystem.denyRead ?? [],
-    customConfig?.filesystem?.allowRead ?? config?.filesystem.allowRead ?? [],
-  )
+  const { readConfig, writeConfig } = expandFilesystemPolicy({
+    denyRead:
+      customConfig?.filesystem?.denyRead ?? config?.filesystem.denyRead ?? [],
+    allowRead:
+      customConfig?.filesystem?.allowRead ?? config?.filesystem.allowRead ?? [],
+    allowWrite:
+      customConfig?.filesystem?.allowWrite ??
+      config?.filesystem.allowWrite ??
+      [],
+    denyWrite:
+      customConfig?.filesystem?.denyWrite ?? config?.filesystem.denyWrite ?? [],
+  })
 
   // Check if network config is specified - this determines if we need network restrictions
   // Network restriction is needed when:

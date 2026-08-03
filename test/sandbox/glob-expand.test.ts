@@ -254,6 +254,56 @@ describe('expandGlobPatterns', () => {
     expect(child.status).toBe(0)
     expect(readFileSync(invocationLog, 'utf8')).toBe('x')
   })
+
+  it('expands every filesystem policy glob in one find invocation', () => {
+    const wrapperDir = join(RAW_BASE_DIR, 'manager-find-wrapper')
+    const invocationLog = join(RAW_BASE_DIR, 'manager-find-invocations')
+    const realFind = spawnSync('which', ['find'], {
+      encoding: 'utf8',
+    }).stdout.trim()
+    mkdirSync(wrapperDir, { recursive: true })
+    writeFileSync(
+      join(wrapperDir, 'find'),
+      `#!/bin/sh\nprintf x >> "$FIND_INVOCATION_LOG"\nexec "${realFind}" "$@"\n`,
+    )
+    chmodSync(join(wrapperDir, 'find'), 0o755)
+
+    const runtimeConfig = {
+      network: {
+        allowedDomains: [],
+        deniedDomains: [],
+        allowAllDomains: true,
+      },
+      filesystem: {
+        denyRead: [join(FIRST_DIR, '**/.env*')],
+        allowRead: [join(FIRST_DIR, '**/.env.*.example')],
+        allowWrite: [join(SECOND_DIR, '*.env')],
+        denyWrite: [join(FIRST_DIR, '**/.env')],
+      },
+    }
+    const modulePath = join(process.cwd(), 'src/sandbox/sandbox-manager.ts')
+    const child = spawnSync(
+      process.execPath,
+      [
+        '-e',
+        `import { SandboxManager } from ${JSON.stringify(modulePath)};
+SandboxManager.updateConfig(${JSON.stringify(runtimeConfig)});
+await SandboxManager.wrapWithSandbox('true');`,
+      ],
+      {
+        encoding: 'utf8',
+        env: {
+          ...process.env,
+          PATH: `${wrapperDir}:${process.env.PATH ?? ''}`,
+          FIND_INVOCATION_LOG: invocationLog,
+        },
+      },
+    )
+
+    expect(child.stderr).toBe('')
+    expect(child.status).toBe(0)
+    expect(readFileSync(invocationLog, 'utf8')).toBe('x')
+  })
 })
 
 // ============================================================================
