@@ -331,18 +331,21 @@ Examples:
 
 **Path Syntax (Linux):**
 
-On Linux, `denyRead` and `denyWrite` globs are expanded to concrete paths that
-exist when the sandbox command is prepared. `allowWrite` globs are not
-supported because bubblewrap can grant writes only to concrete paths.
+On Linux, filesystem globs are expanded to concrete paths that exist when the
+sandbox command is prepared. This applies to `denyRead`, `allowRead`,
+`allowWrite`, and `denyWrite`.
 
 - `"allowWrite": ["src/"]` - Allow write to `src/` directory
+- `"allowWrite": ["src/**/*.ts"]` - Allow writes to matching TypeScript files that exist when the command starts
 - `"denyRead": ["/home/user/.ssh"]` - Deny read to SSH directory
 - `"denyRead": ["/home"], "allowRead": ["."]` - Deny read to all of `/home`, but re-allow the current directory
 - `"denyWrite": ["**/.env"]` - Deny writes to matching `.env` files that exist when the command starts
 
-Glob expansion is a startup snapshot. A `denyWrite` glob does not block a new
-matching path that is created after expansion. Use a literal path when the
-sandbox must also block creation of a known path.
+Glob expansion is a startup snapshot. An `allowWrite` glob grants only matching
+paths that already exist; allow a literal parent directory when the command must
+create new matching paths. A `denyWrite` glob does not block a new matching path
+that is created after expansion; use a literal path when the sandbox must also
+block creation of a known path.
 
 **All platforms:**
 

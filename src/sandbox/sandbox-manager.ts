@@ -448,38 +448,32 @@ function expandFsWriteConfig(
   denyWrite: readonly string[],
 ): FsWriteRestrictionConfig {
   const platform = getPlatform()
-
-  // Bubblewrap cannot grant writes through glob patterns.
-  const allowPaths = allowWrite
-    .map(path => removeTrailingGlobSuffix(path))
-    .filter(path => {
-      if (platform === 'linux' && containsGlobChars(path)) {
-        logForDebugging(`Skipping glob pattern on Linux/WSL: ${path}`)
-        return false
-      }
-      return true
-    })
-
-  const globPatterns = denyWrite.filter(path => {
+  const writePatterns = [...allowWrite, ...denyWrite]
+  const globPatterns = writePatterns.filter(path => {
     const stripped = removeTrailingGlobSuffix(path)
     return platform === 'linux' && containsGlobChars(stripped)
   })
   const expandedGlobs = expandGlobPatterns(globPatterns)
-  const denyPaths = denyWrite.flatMap(path => {
-    const stripped = removeTrailingGlobSuffix(path)
-    if (platform !== 'linux' || !containsGlobChars(stripped)) {
-      return [stripped]
-    }
-    const expanded = expandedGlobs.get(path) ?? []
-    logForDebugging(
-      `[Sandbox] Expanded denyWrite glob pattern "${path}" to ${expanded.length} paths on Linux`,
-    )
-    return expanded
-  })
+
+  const expandPaths = (paths: readonly string[], kind: string): string[] =>
+    paths.flatMap(path => {
+      const stripped = removeTrailingGlobSuffix(path)
+      if (platform !== 'linux' || !containsGlobChars(stripped)) {
+        return [stripped]
+      }
+      const expanded = expandedGlobs.get(path) ?? []
+      logForDebugging(
+        `[Sandbox] Expanded ${kind} glob pattern "${path}" to ${expanded.length} paths on Linux`,
+      )
+      return expanded
+    })
 
   return {
-    allowOnly: [...getDefaultWritePaths(), ...allowPaths],
-    denyWithinAllow: denyPaths,
+    allowOnly: [
+      ...getDefaultWritePaths(),
+      ...expandPaths(allowWrite, 'allowWrite'),
+    ],
+    denyWithinAllow: expandPaths(denyWrite, 'denyWrite'),
   }
 }
 
@@ -938,38 +932,9 @@ function annotateStderrWithSandboxFailures(
   return annotated
 }
 
-/**
- * Returns glob patterns from Edit/Read permission rules that are not
- * fully supported on Linux. Returns empty array on macOS or when
- * sandboxing is disabled.
- *
- * Patterns ending with /** are excluded since they work as subpaths.
- */
+/** Return filesystem glob patterns that are not fully supported on Linux. */
 function getLinuxGlobPatternWarnings(): string[] {
-  // Only warn on Linux/WSL (bubblewrap doesn't support globs)
-  // macOS supports glob patterns via regex conversion
-  if (getPlatform() !== 'linux' || !config) {
-    return []
-  }
-
-  const globPatterns: string[] = []
-
-  // Check filesystem paths for glob patterns
-  // denyRead and denyWrite are excluded because their globs are expanded to
-  // concrete paths on Linux.
-  const allPaths = config.filesystem.allowWrite
-
-  for (const path of allPaths) {
-    // Strip trailing /** since that's just a subpath (directory and everything under it)
-    const pathWithoutTrailingStar = removeTrailingGlobSuffix(path)
-
-    // Only warn if there are still glob characters after removing trailing /**
-    if (containsGlobChars(pathWithoutTrailingStar)) {
-      globPatterns.push(path)
-    }
-  }
-
-  return globPatterns
+  return []
 }
 
 // ============================================================================

@@ -440,6 +440,8 @@ describe.if(isLinux)('getFsWriteConfig with glob patterns on Linux', () => {
 
   beforeAll(() => {
     mkdirSync(RAW_TEST_DIR, { recursive: true })
+    mkdirSync(join(RAW_TEST_DIR, 'writable-one'), { recursive: true })
+    mkdirSync(join(RAW_TEST_DIR, 'writable-two'), { recursive: true })
     writeFileSync(join(RAW_TEST_DIR, 'secret.env'), 'SECRET=value')
     writeFileSync(join(RAW_TEST_DIR, 'token.env'), 'TOKEN=value')
     writeFileSync(join(RAW_TEST_DIR, 'readme.txt'), 'readme')
@@ -485,6 +487,35 @@ describe.if(isLinux)('getFsWriteConfig with glob patterns on Linux', () => {
 
     await SandboxManager.reset()
   })
+
+  it('expands glob allowWrite patterns to concrete paths on Linux', async () => {
+    const { SandboxManager } = await import(
+      '../../src/sandbox/sandbox-manager.js'
+    )
+
+    await SandboxManager.reset()
+    await SandboxManager.initialize({
+      network: {
+        allowedDomains: [],
+        deniedDomains: [],
+      },
+      filesystem: {
+        denyRead: [],
+        allowWrite: [join(RAW_TEST_DIR, 'writable-*')],
+        denyWrite: [],
+      },
+    })
+
+    const writeConfig = SandboxManager.getFsWriteConfig()
+    const realTestDir = realPath(RAW_TEST_DIR)
+
+    expect(writeConfig.allowOnly).toContain(join(realTestDir, 'writable-one'))
+    expect(writeConfig.allowOnly).toContain(join(realTestDir, 'writable-two'))
+    expect(writeConfig.allowOnly).not.toContain(join(realTestDir, 'readme.txt'))
+    expect(writeConfig.allowOnly.some(path => path.includes('*'))).toBe(false)
+
+    await SandboxManager.reset()
+  })
 })
 
 // ============================================================================
@@ -519,7 +550,7 @@ describe.if(isLinux)('getLinuxGlobPatternWarnings after fix', () => {
     await SandboxManager.reset()
   })
 
-  it('should warn about allowWrite but not denyWrite globs on Linux', async () => {
+  it('should not warn about expanded write globs on Linux', async () => {
     const { SandboxManager } = await import(
       '../../src/sandbox/sandbox-manager.js'
     )
@@ -539,13 +570,97 @@ describe.if(isLinux)('getLinuxGlobPatternWarnings after fix', () => {
 
     const warnings = SandboxManager.getLinuxGlobPatternWarnings()
 
-    // allowWrite globs remain unsupported; denyWrite globs are expanded.
-    expect(warnings).toContain('/tmp/test/*.log')
-    expect(warnings).not.toContain('/tmp/test/secret_*')
+    expect(warnings).toEqual([])
 
     await SandboxManager.reset()
   })
 })
+
+describe.if(isLinux)(
+  'allowWrite with glob patterns - Linux integration',
+  () => {
+    const RAW_BASE_DIR = join(tmpdir(), 'glob-allow-write-integ-' + Date.now())
+    const RAW_TEST_DIR = join(RAW_BASE_DIR, 'testdir')
+    const ALLOWED_FILE = join(RAW_TEST_DIR, 'allowed.writable')
+    const BLOCKED_FILE = join(RAW_TEST_DIR, 'blocked.txt')
+
+    beforeAll(() => {
+      mkdirSync(RAW_TEST_DIR, { recursive: true })
+      writeFileSync(ALLOWED_FILE, 'ALLOWED_DATA')
+      writeFileSync(BLOCKED_FILE, 'BLOCKED_DATA')
+    })
+
+    afterAll(() => {
+      rmSync(RAW_BASE_DIR, { recursive: true, force: true })
+    })
+
+    it('allows writes to existing paths that match allowWrite globs', async () => {
+      const { SandboxManager } = await import(
+        '../../src/sandbox/sandbox-manager.js'
+      )
+
+      await SandboxManager.reset()
+      await SandboxManager.initialize({
+        network: {
+          allowedDomains: [],
+          deniedDomains: [],
+        },
+        filesystem: {
+          denyRead: [],
+          allowWrite: [join(RAW_TEST_DIR, '*.writable')],
+          denyWrite: [],
+        },
+      })
+
+      const command = await SandboxManager.wrapWithSandbox(
+        `printf CHANGED > ${ALLOWED_FILE}`,
+      )
+      const result = spawnSync(command, {
+        shell: true,
+        encoding: 'utf8',
+        timeout: 5000,
+      })
+
+      expect(result.status).toBe(0)
+      expect(readFileSync(ALLOWED_FILE, 'utf8')).toBe('CHANGED')
+
+      await SandboxManager.reset()
+    })
+
+    it('keeps non-matching paths read-only', async () => {
+      const { SandboxManager } = await import(
+        '../../src/sandbox/sandbox-manager.js'
+      )
+
+      await SandboxManager.reset()
+      await SandboxManager.initialize({
+        network: {
+          allowedDomains: [],
+          deniedDomains: [],
+        },
+        filesystem: {
+          denyRead: [],
+          allowWrite: [join(RAW_TEST_DIR, '*.writable')],
+          denyWrite: [],
+        },
+      })
+
+      const command = await SandboxManager.wrapWithSandbox(
+        `printf CHANGED > ${BLOCKED_FILE}`,
+      )
+      const result = spawnSync(command, {
+        shell: true,
+        encoding: 'utf8',
+        timeout: 5000,
+      })
+
+      expect(result.status).not.toBe(0)
+      expect(readFileSync(BLOCKED_FILE, 'utf8')).toBe('BLOCKED_DATA')
+
+      await SandboxManager.reset()
+    })
+  },
+)
 
 describe.if(isLinux)('denyWrite with glob patterns - Linux integration', () => {
   const RAW_BASE_DIR = join(tmpdir(), 'glob-deny-write-integ-' + Date.now())
