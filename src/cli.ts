@@ -6,6 +6,7 @@ import type { SandboxRuntimeConfig } from './sandbox/sandbox-config.js'
 import { spawn } from 'child_process'
 import { logForDebugging } from './utils/debug.js'
 import { loadConfig, loadConfigFromString } from './utils/config-loader.js'
+import { signalLinuxProcessTree } from './utils/process-tree.js'
 import * as readline from 'readline'
 import * as fs from 'fs'
 import * as path from 'path'
@@ -181,8 +182,21 @@ async function main(): Promise<void> {
             stdio: 'inherit',
           })
 
+          // bubblewrap's --new-session disconnects the sandbox from the
+          // controlling terminal, so the kernel cannot deliver terminal resize
+          // notifications to interactive workloads. Forward SIGWINCH through
+          // the host-visible descendant tree while retaining that isolation.
+          const forwardSigwinch = (): void => {
+            if (process.platform === 'linux' && child.pid !== undefined) {
+              signalLinuxProcessTree(child.pid, 'SIGWINCH')
+            }
+          }
+          process.on('SIGWINCH', forwardSigwinch)
+
           // Handle process exit
           child.on('exit', (code, signal) => {
+            process.off('SIGWINCH', forwardSigwinch)
+
             // Clean up bwrap mount point artifacts before exiting.
             // On Linux, bwrap creates empty files on the host when protecting
             // non-existent deny paths. This removes them.
