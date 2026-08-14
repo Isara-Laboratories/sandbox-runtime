@@ -46,7 +46,7 @@ jobs:
         if: matrix.os == 'linux'
         run: |
           sudo apt-get update
-          sudo apt-get install -y bubblewrap libseccomp-dev gcc socat ripgrep apparmor-profiles zsh
+          sudo apt-get install -y bubblewrap libseccomp-dev gcc socat ripgrep fd-find apparmor-profiles zsh
 
       - name: Enable unprivileged user namespaces (Linux)
         if: matrix.os == 'linux'
@@ -126,7 +126,7 @@ jobs:
             ubuntu:24.04 \
             bash -euo pipefail -c '
               apt-get update -qq
-              apt-get install -y -qq bubblewrap socat ripgrep python3 curl ca-certificates unzip gcc libseccomp-dev
+              apt-get install -y -qq bubblewrap socat ripgrep fd-find python3 curl ca-certificates unzip gcc libseccomp-dev
               curl -fsSL https://bun.sh/install | bash
               export PATH="$HOME/.bun/bin:$PATH"
               curl -fsSL https://deb.nodesource.com/setup_18.x | bash -

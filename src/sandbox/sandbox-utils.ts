@@ -4,6 +4,7 @@ import * as fs from 'fs'
 import { spawnSync } from 'child_process'
 import { getPlatform } from '../utils/platform.js'
 import { logForDebugging } from '../utils/debug.js'
+import { findFdCommand } from '../utils/fd.js'
 
 /**
  * Dangerous files that should be protected from writes.
@@ -507,9 +508,9 @@ function getGlobExpansion(globPath: string): GlobExpansion | undefined {
     originalPattern: globPath,
     regex: new RegExp(regexSource),
     baseDir,
-    // find and globToRegex disagree on a few bracket/backslash edge cases.
-    // Do not use those patterns as a native prefilter because a false negative
-    // here would silently omit a sandbox restriction.
+    // fd's Rust regex engine and globToRegex disagree on a few bracket and
+    // backslash edge cases. Do not prefilter those patterns: returning every
+    // entry is slower but lets the existing JavaScript regex remain authoritative.
     namePattern: /[\\[\]]/.test(basenamePattern) ? undefined : basenamePattern,
   }
 }
@@ -536,12 +537,25 @@ function collapseNestedDirectories(directories: string[]): string[] {
   return roots
 }
 
+function buildFdNameFilter(expansions: readonly GlobExpansion[]): string {
+  const namePatterns = [
+    ...new Set(expansions.map(expansion => expansion.namePattern)),
+  ]
+  if (namePatterns.includes(undefined)) {
+    return '.'
+  }
+  return (namePatterns as string[])
+    .map(namePattern => `(?:${globToRegex(namePattern)})`)
+    .join('|')
+}
+
 /**
- * Expand multiple glob patterns with one native filesystem scan.
+ * Expand multiple glob patterns with one parallel filesystem scan.
  *
- * `find` filters by the final path component while traversing each minimal root
- * once. Results are then checked with globToRegex() so callers retain the same
- * matching semantics used by the sandbox permission system.
+ * fd filters by final path component while traversing every minimal root once.
+ * Hidden and ignored entries remain in scope, and fd's default no-follow
+ * behavior matches find's previous symlink traversal semantics. Every candidate
+ * is checked with globToRegex(), which remains the policy authority.
  */
 export function expandGlobPatterns(
   globPaths: readonly string[],
@@ -556,41 +570,50 @@ export function expandGlobPatterns(
     return results
   }
 
+  const fdCommand = findFdCommand()
+  if (fdCommand === null) {
+    throw new Error(
+      'fd/fdfind not installed (required for Linux filesystem glob expansion)',
+    )
+  }
+
   const roots = collapseNestedDirectories(
     expansions.map(expansion => expansion.baseDir),
   )
-  const namePatterns = [
-    ...new Set(expansions.map(expansion => expansion.namePattern)),
-  ]
-  const findExpression = namePatterns.includes(undefined)
-    ? []
-    : [
-        '(',
-        ...(namePatterns as string[]).flatMap((namePattern, index) => [
-          ...(index === 0 ? [] : ['-o']),
-          '-name',
-          namePattern,
-        ]),
-        ')',
-      ]
-  const findResult = spawnSync(
-    'find',
-    [...roots, ...findExpression, '-print0'],
+  const fdResult = spawnSync(
+    fdCommand,
+    [
+      '--hidden',
+      '--no-ignore',
+      '--absolute-path',
+      '--print0',
+      '--case-sensitive',
+      '--no-follow',
+      '--color',
+      'never',
+      '--show-errors',
+      '--',
+      buildFdNameFilter(expansions),
+      ...roots,
+    ],
     {
       encoding: 'buffer',
       maxBuffer: 1024 * 1024 * 1024,
     },
   )
 
-  if (findResult.error || findResult.status !== 0) {
-    const detail = findResult.error?.message ?? findResult.stderr.toString()
-    throw new Error(
-      `Failed to expand sandbox glob patterns with find: ${detail}`,
-    )
+  const scannerError = fdResult.stderr.toString()
+  if (fdResult.error || fdResult.status !== 0 || scannerError !== '') {
+    const detail = fdResult.error?.message ?? scannerError
+    throw new Error(`Failed to expand sandbox glob patterns with fd: ${detail}`)
   }
 
-  for (const matchedPath of findResult.stdout.toString().split('\0')) {
-    if (!matchedPath) continue
+  for (const fdPath of fdResult.stdout.toString().split('\0')) {
+    if (!fdPath) continue
+    const matchedPath =
+      fdPath.length > 1 && fdPath.endsWith(path.sep)
+        ? fdPath.slice(0, -1)
+        : fdPath
     for (const expansion of expansions) {
       if (expansion.regex.test(matchedPath)) {
         results.get(expansion.originalPattern)?.push(matchedPath)
