@@ -11,7 +11,7 @@ A lightweight sandboxing tool for enforcing filesystem and network restrictions 
 ## Installation
 
 ```bash
-npm install -g https://github.com/Isara-Laboratories/sandbox-runtime/releases/download/v0.0.53-isara.2/anthropic-ai-sandbox-runtime-0.0.53-isara.2.tgz
+npm install -g https://github.com/Isara-Laboratories/sandbox-runtime/releases/download/v0.0.53-isara.3/anthropic-ai-sandbox-runtime-0.0.53-isara.3.tgz
 ```
 
 ## Basic Usage
@@ -448,6 +448,11 @@ Watchman accesses files outside the sandbox boundaries, which will trigger permi
   - Ubuntu/Debian: `apt-get install ripgrep`
   - Fedora: `dnf install ripgrep`
   - Arch: `pacman -S ripgrep`
+- `fd` / `fdfind` - Parallel filesystem scanner for glob expansion
+  - Ubuntu/Debian: `apt-get install fd-find` (installs `fdfind`)
+  - Fedora: `dnf install fd-find`
+  - Arch: `pacman -S fd`
+  - Homebrew: `brew install fd`
 
 **Ubuntu 24.04+ note:** These releases enable `kernel.apparmor_restrict_unprivileged_userns` by default, which allows `unshare(CLONE_NEWUSER)` but strips capabilities from the resulting namespace. Both bubblewrap and the seccomp isolation layer need capability-bearing user namespaces. Disable the restriction with:
 

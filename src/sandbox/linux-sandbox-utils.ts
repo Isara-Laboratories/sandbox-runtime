@@ -8,6 +8,7 @@ import type { ChildProcess } from 'node:child_process'
 import { tmpdir } from 'node:os'
 import path, { join } from 'node:path'
 import { ripGrep } from '../utils/ripgrep.js'
+import { findFdCommand } from '../utils/fd.js'
 import {
   generateProxyEnvVars,
   normalizePathForSandbox,
@@ -381,6 +382,7 @@ export function cleanupBwrapMountPoints(opts?: { force?: boolean }): void {
 export type LinuxDependencyStatus = {
   hasBwrap: boolean
   hasSocat: boolean
+  hasFd: boolean
   hasSeccompApply: boolean
 }
 
@@ -403,6 +405,7 @@ export function getLinuxDependencyStatus(
   return {
     hasBwrap: whichSync('bwrap') !== null,
     hasSocat: whichSync('socat') !== null,
+    hasFd: findFdCommand() !== null,
     hasSeccompApply: seccompConfig?.argv0
       ? true
       : getApplySeccompBinaryPath(seccompConfig?.applyPath) !== null,
@@ -421,6 +424,11 @@ export function checkLinuxDependencies(
   if (whichSync('bwrap') === null)
     errors.push('bubblewrap (bwrap) not installed')
   if (whichSync('socat') === null) errors.push('socat not installed')
+  if (findFdCommand() === null) {
+    errors.push(
+      'fd/fdfind not installed (required for Linux filesystem glob expansion)',
+    )
+  }
 
   if (
     !seccompConfig?.argv0 &&

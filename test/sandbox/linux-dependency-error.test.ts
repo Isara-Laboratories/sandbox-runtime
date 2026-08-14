@@ -56,14 +56,40 @@ describe('checkLinuxDependencies', () => {
     expect(result.errors.length).toBe(1)
   })
 
-  test('returns multiple errors when both bwrap and socat missing', () => {
+  test('accepts fd when fdfind is unavailable', () => {
+    whichSpy.mockImplementation((bin: string) =>
+      bin === 'fdfind' ? null : `/usr/bin/${bin}`,
+    )
+
+    const result = checkLinuxDependencies()
+
+    expect(result.errors).toEqual([])
+  })
+
+  test('returns error when both fdfind and fd are missing', () => {
+    whichSpy.mockImplementation((bin: string) =>
+      bin === 'fdfind' || bin === 'fd' ? null : `/usr/bin/${bin}`,
+    )
+
+    const result = checkLinuxDependencies()
+
+    expect(result.errors).toContain(
+      'fd/fdfind not installed (required for Linux filesystem glob expansion)',
+    )
+    expect(result.errors.length).toBe(1)
+  })
+
+  test('returns multiple errors when Linux runtime dependencies are missing', () => {
     whichSpy.mockReturnValue(null)
 
     const result = checkLinuxDependencies()
 
     expect(result.errors).toContain('bubblewrap (bwrap) not installed')
     expect(result.errors).toContain('socat not installed')
-    expect(result.errors.length).toBe(2)
+    expect(result.errors).toContain(
+      'fd/fdfind not installed (required for Linux filesystem glob expansion)',
+    )
+    expect(result.errors.length).toBe(3)
   })
 
   test('returns warning when apply-seccomp missing', () => {
@@ -101,6 +127,7 @@ describe('getLinuxDependencyStatus', () => {
 
     expect(status.hasBwrap).toBe(true)
     expect(status.hasSocat).toBe(true)
+    expect(status.hasFd).toBe(true)
     expect(status.hasSeccompApply).toBe(true)
   })
 
@@ -124,6 +151,18 @@ describe('getLinuxDependencyStatus', () => {
 
     expect(status.hasSocat).toBe(false)
     expect(status.hasBwrap).toBe(true)
+  })
+
+  test('reports fd unavailable when neither binary name is installed', () => {
+    whichSpy.mockImplementation((bin: string) =>
+      bin === 'fdfind' || bin === 'fd' ? null : `/usr/bin/${bin}`,
+    )
+
+    const status = getLinuxDependencyStatus()
+
+    expect(status.hasFd).toBe(false)
+    expect(status.hasBwrap).toBe(true)
+    expect(status.hasSocat).toBe(true)
   })
 
   test('reports seccomp unavailable when apply binary missing', () => {

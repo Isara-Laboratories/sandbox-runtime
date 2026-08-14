@@ -29,11 +29,21 @@ function realPath(p: string): string {
   }
 }
 
+function fdPath(): string {
+  for (const command of ['fdfind', 'fd']) {
+    const result = spawnSync('which', [command], { encoding: 'utf8' })
+    if (result.status === 0) {
+      return result.stdout.trim()
+    }
+  }
+  throw new Error('fd/fdfind is required to run Linux glob expansion tests')
+}
+
 // ============================================================================
 // Tests for expandGlobPattern()
 // ============================================================================
 
-describe('expandGlobPattern', () => {
+describe.if(isLinux)('expandGlobPattern', () => {
   // Use raw path for creation, real path for assertions
   const RAW_BASE_DIR = join(tmpdir(), 'glob-expand-test-' + Date.now())
   const RAW_TEST_DIR = join(RAW_BASE_DIR, 'testdir')
@@ -150,7 +160,7 @@ describe('expandGlobPattern', () => {
   })
 })
 
-describe('expandGlobPatterns', () => {
+describe.if(isLinux)('expandGlobPatterns', () => {
   const RAW_BASE_DIR = join(tmpdir(), 'glob-expand-batch-test-' + Date.now())
   const FIRST_DIR = join(RAW_BASE_DIR, 'first tree')
   const SECOND_DIR = join(RAW_BASE_DIR, 'second-tree')
@@ -166,6 +176,7 @@ describe('expandGlobPatterns', () => {
     writeFileSync(join(FIRST_DIR, 'nested', '.env.local.example'), 'SAFE=value')
     writeFileSync(join(FIRST_DIR, 'nested', 'line\nbreak.env'), 'ODD=value')
     writeFileSync(join(FIRST_DIR, 'nested', 'choicea.env'), 'CHOICE=value')
+    writeFileSync(join(FIRST_DIR, '.gitignore'), 'nested/\n')
     writeFileSync(join(SECOND_DIR, 'other.env'), 'OTHER=value')
     REAL_FIRST_DIR = realPath(FIRST_DIR)
     REAL_SECOND_DIR = realPath(SECOND_DIR)
@@ -214,18 +225,16 @@ describe('expandGlobPatterns', () => {
     ])
   })
 
-  it('invokes find once for the entire batch', () => {
-    const wrapperDir = join(RAW_BASE_DIR, 'find-wrapper')
-    const invocationLog = join(RAW_BASE_DIR, 'find-invocations')
-    const realFind = spawnSync('which', ['find'], {
-      encoding: 'utf8',
-    }).stdout.trim()
+  it('invokes fdfind once for the entire batch', () => {
+    const wrapperDir = join(RAW_BASE_DIR, 'fdfind-wrapper')
+    const invocationLog = join(RAW_BASE_DIR, 'fdfind-invocations')
+    const realFd = fdPath()
     mkdirSync(wrapperDir, { recursive: true })
     writeFileSync(
-      join(wrapperDir, 'find'),
-      `#!/bin/sh\nprintf x >> "$FIND_INVOCATION_LOG"\nexec "${realFind}" "$@"\n`,
+      join(wrapperDir, 'fdfind'),
+      `#!/bin/sh\nprintf x >> "$FD_INVOCATION_LOG"\nexec "${realFd}" "$@"\n`,
     )
-    chmodSync(join(wrapperDir, 'find'), 0o755)
+    chmodSync(join(wrapperDir, 'fdfind'), 0o755)
 
     const patterns = [
       join(FIRST_DIR, '**/.env'),
@@ -245,7 +254,7 @@ describe('expandGlobPatterns', () => {
         env: {
           ...process.env,
           PATH: `${wrapperDir}:${process.env.PATH ?? ''}`,
-          FIND_INVOCATION_LOG: invocationLog,
+          FD_INVOCATION_LOG: invocationLog,
         },
       },
     )
@@ -255,20 +264,48 @@ describe('expandGlobPatterns', () => {
     expect(readFileSync(invocationLog, 'utf8')).toBe('x')
   })
 
-  it.if(isLinux)(
-    'expands every filesystem policy glob in one find invocation',
-    () => {
-      const wrapperDir = join(RAW_BASE_DIR, 'manager-find-wrapper')
-      const invocationLog = join(RAW_BASE_DIR, 'manager-find-invocations')
-      const realFind = spawnSync('which', ['find'], {
+  it('fails closed when fdfind cannot complete the scan', () => {
+    const wrapperDir = join(RAW_BASE_DIR, 'broken-fdfind-wrapper')
+    mkdirSync(wrapperDir, { recursive: true })
+    writeFileSync(
+      join(wrapperDir, 'fdfind'),
+      '#!/bin/sh\necho traversal-failed >&2\nexit 2\n',
+    )
+    chmodSync(join(wrapperDir, 'fdfind'), 0o755)
+
+    const pattern = join(FIRST_DIR, '**/.env')
+    const modulePath = join(process.cwd(), 'src/sandbox/sandbox-utils.ts')
+    const child = spawnSync(
+      process.execPath,
+      [
+        '-e',
+        `import { expandGlobPatterns } from ${JSON.stringify(modulePath)}; expandGlobPatterns([${JSON.stringify(pattern)}])`,
+      ],
+      {
         encoding: 'utf8',
-      }).stdout.trim()
+        env: {
+          ...process.env,
+          PATH: `${wrapperDir}:${process.env.PATH ?? ''}`,
+        },
+      },
+    )
+
+    expect(child.status).not.toBe(0)
+    expect(child.stderr).toContain('traversal-failed')
+  })
+
+  it.if(isLinux)(
+    'expands every filesystem policy glob in one fdfind invocation',
+    () => {
+      const wrapperDir = join(RAW_BASE_DIR, 'manager-fdfind-wrapper')
+      const invocationLog = join(RAW_BASE_DIR, 'manager-fdfind-invocations')
+      const realFd = fdPath()
       mkdirSync(wrapperDir, { recursive: true })
       writeFileSync(
-        join(wrapperDir, 'find'),
-        `#!/bin/sh\nprintf x >> "$FIND_INVOCATION_LOG"\nexec "${realFind}" "$@"\n`,
+        join(wrapperDir, 'fdfind'),
+        `#!/bin/sh\nprintf x >> "$FD_INVOCATION_LOG"\nexec "${realFd}" "$@"\n`,
       )
-      chmodSync(join(wrapperDir, 'find'), 0o755)
+      chmodSync(join(wrapperDir, 'fdfind'), 0o755)
 
       const runtimeConfig = {
         network: {
@@ -297,7 +334,7 @@ await SandboxManager.wrapWithSandbox('true');`,
           env: {
             ...process.env,
             PATH: `${wrapperDir}:${process.env.PATH ?? ''}`,
-            FIND_INVOCATION_LOG: invocationLog,
+            FD_INVOCATION_LOG: invocationLog,
           },
         },
       )
