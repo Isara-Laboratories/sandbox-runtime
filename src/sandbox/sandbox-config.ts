@@ -180,6 +180,12 @@ export const NetworkConfigSchema = z.object({
  * Filesystem configuration schema for validation
  */
 export const FilesystemConfigSchema = z.object({
+  linuxBackend: z
+    .enum(['bubblewrap', 'apparmor'])
+    .optional()
+    .describe(
+      'Linux filesystem enforcement backend. AppArmor requires the matching preloaded enforcing profile; never falls back. Ignored on macOS.',
+    ),
   denyRead: z.array(filesystemPathSchema).describe('Paths denied for reading'),
   allowRead: z
     .array(filesystemPathSchema)
@@ -191,6 +197,12 @@ export const FilesystemConfigSchema = z.object({
   allowWrite: z
     .array(filesystemPathSchema)
     .describe('Paths allowed for writing'),
+  secretFiles: z
+    .array(z.string())
+    .optional()
+    .describe(
+      'Linux AppArmor backend only: host files mounted read-only at /dev/srt/secrets/<basename> inside the sandbox, readable despite denyRead, without changing the AppArmor profile.',
+    ),
   denyWrite: z
     .array(filesystemPathSchema)
     .describe('Paths denied for writing (takes precedence over allowWrite)'),

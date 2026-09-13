@@ -8,6 +8,12 @@ A lightweight sandboxing tool for enforcing filesystem and network restrictions 
 >
 > The Sandbox Runtime is a research preview developed for [Claude Code](https://www.claude.com/product/claude-code) to enable safer AI agents. It's being made available as an early open source preview to help the broader ecosystem build more secure agentic systems. As this is an early research preview, APIs and configuration formats may evolve. We welcome feedback and contributions to make AI agents safer by default!
 
+## Experimental Linux AppArmor filesystem backend
+
+This branch includes an opt-in, no-scan filesystem backend. See [APPARMOR.md](APPARMOR.md)
+for setup, tests, and stricter compatibility rules. It runs from a worktree without
+replacing installed CLIs; macOS and the default Linux backend are unchanged.
+
 ## Installation
 
 ```bash

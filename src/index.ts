@@ -1,4 +1,10 @@
 // Library exports
+export {
+  APPARMOR_SECRETS_DIR,
+  compileAppArmorFilesystem,
+  secretAliasPath,
+  type AppArmorPolicy,
+} from './sandbox/apparmor.js'
 export { SandboxManager } from './sandbox/sandbox-manager.js'
 export { SandboxViolationStore } from './sandbox/sandbox-violation-store.js'
 

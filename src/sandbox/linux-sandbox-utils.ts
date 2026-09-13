@@ -1,4 +1,5 @@
 import shellquote from 'shell-quote'
+import { appArmorCommand, secretAliasPath } from './apparmor.js'
 import { logForDebugging } from '../utils/debug.js'
 import { whichSync } from '../utils/which.js'
 import { randomBytes } from 'node:crypto'
@@ -35,6 +36,10 @@ export interface LinuxNetworkBridgeContext {
 
 export interface LinuxSandboxParams {
   command: string
+  /** Derived from the complete policy by sandbox-manager; not an arbitrary skip flag. */
+  appArmorProfile?: string
+  /** AppArmor mode only: host files exposed read-only under APPARMOR_SECRETS_DIR. */
+  secretFiles?: string[]
   needsNetworkRestriction: boolean
   httpSocketPath?: string
   socksSocketPath?: string
@@ -417,6 +422,7 @@ export function getLinuxDependencyStatus(
  */
 export function checkLinuxDependencies(
   seccompConfig?: SeccompConfig,
+  appArmorEnabled = false,
 ): SandboxDependencyCheck {
   const errors: string[] = []
   const warnings: string[] = []
@@ -424,7 +430,10 @@ export function checkLinuxDependencies(
   if (whichSync('bwrap') === null)
     errors.push('bubblewrap (bwrap) not installed')
   if (whichSync('socat') === null) errors.push('socat not installed')
-  if (findFdCommand() === null) {
+  if (appArmorEnabled && !fs.existsSync('/usr/bin/aa-exec')) {
+    errors.push('AppArmor backend requires /usr/bin/aa-exec')
+  }
+  if (!appArmorEnabled && findFdCommand() === null) {
     errors.push(
       'fd/fdfind not installed (required for Linux filesystem glob expansion)',
     )
@@ -695,6 +704,7 @@ async function generateFilesystemArgs(
   mandatoryDenySearchDepth: number = DEFAULT_MANDATORY_DENY_SEARCH_DEPTH,
   allowGitConfig = false,
   abortSignal?: AbortSignal,
+  mandatoryDenyHandledByAppArmor = false,
 ): Promise<string[]> {
   const args: string[] = []
   // fs already imported
@@ -765,12 +775,14 @@ async function generateFilesystemArgs(
     // Deny writes within allowed paths (user-specified + mandatory denies)
     const denyPaths = [
       ...(writeConfig.denyWithinAllow || []),
-      ...(await linuxGetMandatoryDenyPaths(
-        ripgrepConfig,
-        mandatoryDenySearchDepth,
-        allowGitConfig,
-        abortSignal,
-      )),
+      ...(mandatoryDenyHandledByAppArmor
+        ? []
+        : await linuxGetMandatoryDenyPaths(
+            ripgrepConfig,
+            mandatoryDenySearchDepth,
+            allowGitConfig,
+            abortSignal,
+          )),
     ]
 
     // Dedup post-normalization: entries like ['~/.foo', '/home/user/.foo']
@@ -1057,7 +1069,9 @@ export async function wrapCommandWithSandboxLinux(
   params: LinuxSandboxParams,
 ): Promise<string> {
   const {
-    command,
+    command: originalCommand,
+    appArmorProfile,
+    secretFiles = [],
     needsNetworkRestriction,
     httpSocketPath,
     socksSocketPath,
@@ -1076,6 +1090,10 @@ export async function wrapCommandWithSandboxLinux(
     abortSignal,
   } = params
 
+  const command = appArmorProfile
+    ? shellquote.quote(appArmorCommand(appArmorProfile, originalCommand))
+    : originalCommand
+
   // Determine if we have restrictions to apply
   // Read: denyOnly pattern - empty array means no restrictions
   // Write: allowOnly pattern - undefined means no restrictions, any config means restrictions
@@ -1089,6 +1107,7 @@ export async function wrapCommandWithSandboxLinux(
     !needsNetworkRestriction &&
     !hasReadRestrictions &&
     !hasWriteRestrictions &&
+    !appArmorProfile &&
     !hasUnixSocketAllowlist
   ) {
     return command
@@ -1119,6 +1138,10 @@ export async function wrapCommandWithSandboxLinux(
       )
 
       if (!applySeccompPrefix) {
+        if (appArmorProfile)
+          throw new Error(
+            'AppArmor mode refuses to drop the requested Unix socket restrictions: apply-seccomp unavailable',
+          )
         logForDebugging(
           '[Sandbox Linux] apply-seccomp binary not available - unix socket blocking disabled. ' +
             'Install @anthropic-ai/sandbox-runtime globally for full protection.',
@@ -1202,18 +1225,35 @@ export async function wrapCommandWithSandboxLinux(
     }
 
     // ========== FILESYSTEM RESTRICTIONS ==========
+    // AppArmor mode: the repository-independent profile owns every deny,
+    // exception and mandatory rule; bwrap binds only the literal writable
+    // roots (read-only root, read-write binds) with no glob or mandatory scan.
+    // The trusted setup runs unconfined; only the workload enters AppArmor.
     const fsArgs = await generateFilesystemArgs(
-      readConfig,
+      appArmorProfile ? undefined : readConfig,
       writeConfig,
       ripgrepConfig,
       mandatoryDenySearchDepth,
       allowGitConfig,
       abortSignal,
+      Boolean(appArmorProfile),
     )
     bwrapArgs.push(...fsArgs)
 
     // Always bind /dev
     bwrapArgs.push('--dev', '/dev')
+
+    if (secretFiles.length) {
+      if (!appArmorProfile)
+        throw new Error('secretFiles require the AppArmor backend')
+      secretFiles.forEach((file, index) => {
+        const source = fs.realpathSync(file)
+        if (!fs.statSync(source).isFile())
+          throw new Error(`secretFiles entry is not a regular file: ${file}`)
+        // Inside bwrap's fresh /dev tmpfs: no host-side mount points are created.
+        bwrapArgs.push('--ro-bind', source, secretAliasPath(index, file))
+      })
+    }
 
     // ========== PID NAMESPACE ISOLATION ==========
     // IMPORTANT: These must come AFTER filesystem binds for nested bwrap to work
@@ -1278,7 +1318,8 @@ export async function wrapCommandWithSandboxLinux(
 
     const restrictions = []
     if (needsNetworkRestriction) restrictions.push('network')
-    if (hasReadRestrictions || hasWriteRestrictions)
+    if (appArmorProfile) restrictions.push('filesystem(apparmor)')
+    else if (hasReadRestrictions || hasWriteRestrictions)
       restrictions.push('filesystem')
     if (applySeccompPrefix) {
       restrictions.push(
