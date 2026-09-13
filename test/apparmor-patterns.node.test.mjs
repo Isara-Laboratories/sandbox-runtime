@@ -120,7 +120,8 @@ test('dotenv template exceptions are subtracted rather than re-allowed after den
 
 test('compiler is deterministic, does not omit mandatory rules, and rejects unsupported syntax', () => {
   const config = {
-    denyRead: ['/tmp/secret'],
+    // /usr is never a symlink (macOS resolves /tmp to /private/tmp).
+    denyRead: ['/usr/srt-test-secret'],
     allowRead: [],
     allowWrite: ['/tmp/project'],
     denyWrite: [],
@@ -143,11 +144,16 @@ test('compiler is deterministic, does not omit mandatory rules, and rejects unsu
     )
   }
   assert.notDeepEqual(
-    text(compileAppArmorFilesystem({ ...config, denyRead: ['/tmp/other'] })),
+    text(
+      compileAppArmorFilesystem({
+        ...config,
+        denyRead: ['/usr/srt-test-other'],
+      }),
+    ),
     a,
   )
   const compiled = compileAppArmorFilesystem(config)
-  assert.equal(compiled.deniesRead('/tmp/secret/key'), true)
+  assert.equal(compiled.deniesRead('/usr/srt-test-secret/key'), true)
   assert.equal(compiled.deniesRead('/dev/srt/secrets/0-.env'), false)
   assert.equal(
     compileAppArmorFilesystem({ ...config, denyRead: ['**/.env'] }).deniesRead(
@@ -172,7 +178,7 @@ test('compiler is deterministic, does not omit mandatory rules, and rejects unsu
   assert.ok(selectors.policy.includes('  deny "/**/.env.local" wkl,'))
   assert.ok(!selectors.policy.includes(process.cwd() + '/**/.env'))
   assert.ok(a.policy.includes('  "/**" rwklix,'))
-  assert.ok(a.policy.includes('  deny "/tmp/secret/**" rwmx,'))
+  assert.ok(a.policy.includes('  deny "/usr/srt-test-secret/**" rwmx,'))
   assert.ok(a.policy.includes('[Gg][Ii][Tt]/[Hh][Oo][Oo][Kk][Ss]'))
   assert.match(a.policy, /flags=\(attach_disconnected,mediate_deleted\)/)
   assert.doesNotMatch(a.policy, /\bmount,|\bcapability,|\bchange_profile/)
