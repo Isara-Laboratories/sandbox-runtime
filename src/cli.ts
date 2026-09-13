@@ -1,5 +1,6 @@
 #!/usr/bin/env node
 import { Command } from 'commander'
+import { compileAppArmorFilesystem } from './sandbox/apparmor.js'
 import shellquote from 'shell-quote'
 import { SandboxManager } from './index.js'
 import type { SandboxRuntimeConfig } from './sandbox/sandbox-config.js'
@@ -52,6 +53,14 @@ async function main(): Promise<void> {
     .argument('[command...]', 'command to run in the sandbox')
     .option('-d, --debug', 'enable debug logging')
     .option(
+      '--apparmor',
+      'use the preloaded AppArmor filesystem policy (Linux only, fail closed)',
+    )
+    .option(
+      '--print-apparmor-profile',
+      'print the AppArmor profile for these settings and cwd; do not launch',
+    )
+    .option(
       '-s, --settings <path>',
       'path to config file (default: ~/.srt-settings.json)',
     )
@@ -70,6 +79,8 @@ async function main(): Promise<void> {
         commandArgs: string[],
         options: {
           debug?: boolean
+          apparmor?: boolean
+          printApparmorProfile?: boolean
           settings?: string
           c?: string
           controlFd?: number
@@ -90,6 +101,18 @@ async function main(): Promise<void> {
               `No config found at ${configPath}, using default config`,
             )
             runtimeConfig = getDefaultConfig()
+          }
+
+          if (options.apparmor || options.printApparmorProfile) {
+            if (process.platform !== 'linux')
+              throw new Error('AppArmor is only available on Linux')
+            runtimeConfig.filesystem.linuxBackend = 'apparmor'
+          }
+          if (options.printApparmorProfile) {
+            process.stdout.write(
+              compileAppArmorFilesystem(runtimeConfig.filesystem).policy,
+            )
+            return
           }
 
           // Initialize sandbox with config

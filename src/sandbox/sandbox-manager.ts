@@ -1,3 +1,4 @@
+import { compileAppArmorFilesystem, secretAliasPath } from './apparmor.js'
 import { createHttpProxyServer } from './http-proxy.js'
 import { createSocksProxyServer } from './socks-proxy.js'
 import type { SocksProxyWrapper } from './socks-proxy.js'
@@ -389,13 +390,15 @@ function checkDependencies(ripgrepConfig?: {
 
   // Check ripgrep - use provided config, then initialized config, then default 'rg'
   const rgToCheck = ripgrepConfig ?? config?.ripgrep ?? { command: 'rg' }
-  if (whichSync(rgToCheck.command) === null) {
+  const appArmorEnabled =
+    getPlatform() === 'linux' && config?.filesystem.linuxBackend === 'apparmor'
+  if (!appArmorEnabled && whichSync(rgToCheck.command) === null) {
     errors.push(`ripgrep (${rgToCheck.command}) not found`)
   }
 
   const platform = getPlatform()
   if (platform === 'linux') {
-    const linuxDeps = checkLinuxDependencies(config?.seccomp)
+    const linuxDeps = checkLinuxDependencies(config?.seccomp, appArmorEnabled)
     errors.push(...linuxDeps.errors)
     warnings.push(...linuxDeps.warnings)
   }
@@ -423,6 +426,7 @@ interface ExpandedFilesystemPolicy {
 
 function expandFilesystemPolicy(
   policy: FilesystemPolicyPaths,
+  preserveGlobs = false,
 ): ExpandedFilesystemPolicy {
   const platform = getPlatform()
   // Linux expansion traverses every minimal policy root. Collect every policy
@@ -435,7 +439,7 @@ function expandFilesystemPolicy(
   ]
   const globPatterns = policyPaths.filter(path => {
     const stripped = removeTrailingGlobSuffix(path)
-    return platform === 'linux' && containsGlobChars(stripped)
+    return !preserveGlobs && platform === 'linux' && containsGlobChars(stripped)
   })
   const expandedGlobs = expandGlobPatterns(globPatterns)
 
@@ -445,7 +449,11 @@ function expandFilesystemPolicy(
   ): string[] =>
     paths.flatMap(path => {
       const stripped = removeTrailingGlobSuffix(path)
-      if (platform !== 'linux' || !containsGlobChars(stripped)) {
+      if (
+        preserveGlobs ||
+        platform !== 'linux' ||
+        !containsGlobChars(stripped)
+      ) {
         return [stripped]
       }
       const expanded = expandedGlobs.get(path) ?? []
@@ -474,12 +482,15 @@ function getFsReadConfig(): FsReadRestrictionConfig {
   if (!config) {
     return { denyOnly: [], allowWithinDeny: [] }
   }
-  return expandFilesystemPolicy({
-    denyRead: config.filesystem.denyRead,
-    allowRead: config.filesystem.allowRead ?? [],
-    allowWrite: config.filesystem.allowWrite,
-    denyWrite: config.filesystem.denyWrite,
-  }).readConfig
+  return expandFilesystemPolicy(
+    {
+      denyRead: config.filesystem.denyRead,
+      allowRead: config.filesystem.allowRead ?? [],
+      allowWrite: config.filesystem.allowWrite,
+      denyWrite: config.filesystem.denyWrite,
+    },
+    config.filesystem.linuxBackend === 'apparmor',
+  ).readConfig
 }
 
 function getFsWriteConfig(): FsWriteRestrictionConfig {
@@ -487,12 +498,15 @@ function getFsWriteConfig(): FsWriteRestrictionConfig {
     return { allowOnly: getDefaultWritePaths(), denyWithinAllow: [] }
   }
 
-  return expandFilesystemPolicy({
-    denyRead: config.filesystem.denyRead,
-    allowRead: config.filesystem.allowRead ?? [],
-    allowWrite: config.filesystem.allowWrite,
-    denyWrite: config.filesystem.denyWrite,
-  }).writeConfig
+  return expandFilesystemPolicy(
+    {
+      denyRead: config.filesystem.denyRead,
+      allowRead: config.filesystem.allowRead ?? [],
+      allowWrite: config.filesystem.allowWrite,
+      denyWrite: config.filesystem.denyWrite,
+    },
+    config.filesystem.linuxBackend === 'apparmor',
+  ).writeConfig
 }
 
 function getNetworkRestrictionConfig(): NetworkRestrictionConfig {
@@ -600,7 +614,11 @@ async function wrapWithSandbox(
   // If neither exists, defaults to empty arrays (most restrictive)
   // Always include default system write paths (like /dev/null, /tmp/claude)
   //
-  const { readConfig, writeConfig } = expandFilesystemPolicy({
+  const appArmorEnabled =
+    platform === 'linux' &&
+    (customConfig?.filesystem?.linuxBackend ??
+      config?.filesystem.linuxBackend) === 'apparmor'
+  const filesystemPolicy = {
     denyRead:
       customConfig?.filesystem?.denyRead ?? config?.filesystem.denyRead ?? [],
     allowRead:
@@ -611,7 +629,57 @@ async function wrapWithSandbox(
       [],
     denyWrite:
       customConfig?.filesystem?.denyWrite ?? config?.filesystem.denyWrite ?? [],
+  }
+  const appArmorPolicy = appArmorEnabled
+    ? compileAppArmorFilesystem({
+        ...filesystemPolicy,
+        allowGitConfig:
+          customConfig?.filesystem?.allowGitConfig ?? getAllowGitConfig(),
+      })
+    : undefined
+  const appArmorProfile = appArmorPolicy?.name
+  // AppArmor mode: the profile holds every deny/exception rule; bwrap binds
+  // the literal writable roots per launch, without any glob expansion scan.
+  if (appArmorEnabled) {
+    for (const p of filesystemPolicy.allowWrite) {
+      if (containsGlobChars(removeTrailingGlobSuffix(p)))
+        throw new Error(
+          `AppArmor mode requires literal allowWrite paths (bind mounts): ${p}`,
+        )
+    }
+  }
+  const secretFiles = appArmorEnabled
+    ? (customConfig?.filesystem?.secretFiles ??
+      config?.filesystem.secretFiles ??
+      [])
+    : []
+  if (
+    !appArmorEnabled &&
+    (customConfig?.filesystem?.secretFiles ?? config?.filesystem.secretFiles)
+      ?.length
+  )
+    throw new Error(
+      'filesystem.secretFiles requires the Linux AppArmor backend',
+    )
+  secretFiles.forEach((file, index) => {
+    const alias = secretAliasPath(index, file)
+    if (appArmorPolicy?.deniesRead(alias))
+      throw new Error(
+        `AppArmor policy denies reading the secret alias path ${alias}; rename the file or adjust denyRead`,
+      )
   })
+  const { readConfig, writeConfig } = appArmorEnabled
+    ? {
+        readConfig: undefined,
+        writeConfig: {
+          allowOnly: [
+            ...getDefaultWritePaths(),
+            ...filesystemPolicy.allowWrite.map(removeTrailingGlobSuffix),
+          ],
+          denyWithinAllow: [],
+        },
+      }
+    : expandFilesystemPolicy(filesystemPolicy)
 
   // Check if network config is specified - this determines if we need network restrictions
   // Network restriction is needed when:
@@ -677,6 +745,8 @@ async function wrapWithSandbox(
     case 'linux':
       return wrapCommandWithSandboxLinux({
         command,
+        appArmorProfile,
+        secretFiles,
         needsNetworkRestriction,
         // Only pass socket paths if proxy is running (when there are domains to filter)
         httpSocketPath: needsNetworkProxy
