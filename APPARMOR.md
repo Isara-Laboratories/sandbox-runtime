@@ -121,11 +121,17 @@ possible SRT glob. It supports the built-in Isara git profile and its normal
   and therefore produce per-directory profiles; prefer absolute or `**/` forms.
 - `allowWrite` entries must be literal paths (they become bind mounts). Writes
   outside them fail with `EROFS`; denies inside them are AppArmor `EACCES`.
+- `.mcp.json` is not a mandatory deny. Existing and newly checked-out MCP plugin
+  configuration can be edited inside writable roots, unless an explicit deny
+  covers it. Review changes before loading that configuration in a trusted client.
+  Git hook, shell startup file, and secret-file protections are unchanged.
 - **Creating new protected directories is denied too**, notably `.git`, `.vscode`,
   and `.idea`. Existing repositories can update normal git files (including config
-  with `allowGitConfig`), but run `git init` or create worktrees on the host before
-  starting the sandbox. This is necessary here to prevent renaming `.git` to an
-  unprotected name, changing its hooks, and moving it back.
+  with `allowGitConfig`), but run `git init` or `git clone` on the host before
+  starting the sandbox. This prevents renaming `.git` to an unprotected name,
+  changing its hooks, and moving it back. Linked worktrees can be created inside
+  writable roots: their `.git` marker is a file, not a directory. Their checkout
+  contents must still obey all other deny rules.
 - `/proc` and `/sys` are always non-writable, even with `allowWrite: ["/"]`.
   Mounts, namespace-map writes, and profile changes remain prohibited.
 - This remains path-based access control, not encryption or inode labeling.

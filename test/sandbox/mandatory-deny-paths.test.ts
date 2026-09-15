@@ -62,7 +62,6 @@ describe.if(isSupportedPlatform)(
       writeFileSync(join(TEST_DIR, '.zprofile'), ORIGINAL_CONTENT)
       writeFileSync(join(TEST_DIR, '.profile'), ORIGINAL_CONTENT)
       writeFileSync(join(TEST_DIR, '.ripgreprc'), ORIGINAL_CONTENT)
-      writeFileSync(join(TEST_DIR, '.mcp.json'), ORIGINAL_CONTENT)
 
       // Create .git with hooks and config
       mkdirSync(join(TEST_DIR, '.git', 'hooks'), { recursive: true })
@@ -96,8 +95,9 @@ describe.if(isSupportedPlatform)(
         ORIGINAL_CONTENT,
       )
 
-      // Create a safe file that SHOULD be writable
+      // Regular files and versioned MCP configuration should be writable.
       writeFileSync(join(TEST_DIR, 'safe-file.txt'), ORIGINAL_CONTENT)
+      writeFileSync(join(TEST_DIR, '.mcp.json'), ORIGINAL_CONTENT)
 
       // Create safe files within .git that SHOULD be writable (not hooks/config)
       mkdirSync(join(TEST_DIR, '.git', 'objects'), { recursive: true })
@@ -139,6 +139,7 @@ describe.if(isSupportedPlatform)(
     async function runSandboxedWrite(
       filePath: string,
       content: string,
+      denyWithinAllow: string[] = [],
     ): Promise<{ success: boolean; stderr: string }> {
       const platform = getPlatform()
       const command = `echo '${content}' > '${filePath}'`
@@ -146,7 +147,7 @@ describe.if(isSupportedPlatform)(
       // Allow writes to current directory, but mandatory denies should still block dangerous files
       const writeConfig = {
         allowOnly: ['.'],
-        denyWithinAllow: [], // Empty - relying on mandatory denies
+        denyWithinAllow, // Empty by default - relying on mandatory denies
       }
 
       let wrappedCommand: string
@@ -198,13 +199,6 @@ describe.if(isSupportedPlatform)(
 
         expect(result.success).toBe(false)
         expect(readFileSync('.zshrc', 'utf8')).toBe(ORIGINAL_CONTENT)
-      })
-
-      it('blocks writes to .mcp.json', async () => {
-        const result = await runSandboxedWrite('.mcp.json', MODIFIED_CONTENT)
-
-        expect(result.success).toBe(false)
-        expect(readFileSync('.mcp.json', 'utf8')).toBe(ORIGINAL_CONTENT)
       })
 
       it('blocks writes to .bash_profile', async () => {
@@ -314,6 +308,42 @@ describe.if(isSupportedPlatform)(
         expect(readFileSync('.idea/workspace.xml', 'utf8')).toBe(
           ORIGINAL_CONTENT,
         )
+      })
+    })
+
+    describe('MCP configuration follows explicit write policy', () => {
+      for (const filePath of ['.mcp.json', 'plugins/example/.mcp.json']) {
+        it(`allows modifying ${filePath}`, async () => {
+          mkdirSync(join(TEST_DIR, 'plugins', 'example'), { recursive: true })
+          writeFileSync(filePath, ORIGINAL_CONTENT)
+          const result = await runSandboxedWrite(filePath, MODIFIED_CONTENT)
+
+          expect(result.success).toBe(true)
+          expect(readFileSync(filePath, 'utf8').trim()).toBe(MODIFIED_CONTENT)
+        })
+      }
+
+      it('allows creating a new nested .mcp.json', async () => {
+        mkdirSync('plugins/new', { recursive: true })
+        const result = await runSandboxedWrite(
+          'plugins/new/.mcp.json',
+          MODIFIED_CONTENT,
+        )
+
+        expect(result.success).toBe(true)
+        expect(readFileSync('plugins/new/.mcp.json', 'utf8').trim()).toBe(
+          MODIFIED_CONTENT,
+        )
+      })
+
+      it('still honors an explicit .mcp.json write deny', async () => {
+        writeFileSync('.mcp.json', ORIGINAL_CONTENT)
+        const result = await runSandboxedWrite('.mcp.json', MODIFIED_CONTENT, [
+          join(TEST_DIR, '.mcp.json'),
+        ])
+
+        expect(result.success).toBe(false)
+        expect(readFileSync('.mcp.json', 'utf8')).toBe(ORIGINAL_CONTENT)
       })
     })
 
@@ -1244,9 +1274,15 @@ describe('macGetMandatoryDenyPatterns - Unit Tests', () => {
   it('still blocks unrelated dangerous dotfiles when allowGitConfig is true', () => {
     const patterns = macGetMandatoryDenyPatterns(true)
 
-    // .bashrc, .zshrc, .mcp.json etc. must remain in the deny list.
+    // Shell startup files must remain in the deny list.
     expect(patterns.some(p => p.endsWith('.bashrc'))).toBe(true)
     expect(patterns.some(p => p.endsWith('.zshrc'))).toBe(true)
-    expect(patterns.some(p => p.endsWith('.mcp.json'))).toBe(true)
+  })
+
+  it('does not auto-protect .mcp.json regardless of allowGitConfig', () => {
+    for (const allowGitConfig of [false, true]) {
+      const patterns = macGetMandatoryDenyPatterns(allowGitConfig)
+      expect(patterns.some(p => p.endsWith('.mcp.json'))).toBe(false)
+    }
   })
 })

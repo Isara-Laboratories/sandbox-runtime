@@ -118,6 +118,28 @@ test('dotenv template exceptions are subtracted rather than re-allowed after den
   for (const s of secrets) assert.equal(accepts(denied, s), true, s)
 })
 
+test('MCP configuration is not mandatory-denied, but explicit write denies still apply', () => {
+  for (const allowGitConfig of [false, true]) {
+    const config = {
+      denyRead: [],
+      allowRead: [],
+      allowWrite: ['/tmp/project'],
+      denyWrite: [],
+      allowGitConfig,
+    }
+    const { policy } = compileAppArmorFilesystem(config)
+    assert.ok(!policy.includes('[Mm][Cc][Pp]'))
+    assert.ok(policy.includes('[Gg][Ii][Tt]/[Hh][Oo][Oo][Kk][Ss]'))
+    assert.ok(policy.includes('[Bb][Aa][Ss][Hh][Rr][Cc]'))
+    const explicit = compileAppArmorFilesystem({
+      ...config,
+      denyWrite: ['**/.mcp.json'],
+    })
+    assert.ok(explicit.policy.includes('  deny "/**/.mcp.json" wkl,'))
+    assert.ok(explicit.policy.includes('  deny "/**/.mcp.json/**" wkl,'))
+  }
+})
+
 test('compiler is deterministic, does not omit mandatory rules, and rejects unsupported syntax', () => {
   const config = {
     // /usr is never a symlink (macOS resolves /tmp to /private/tmp).
