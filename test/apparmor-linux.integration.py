@@ -21,7 +21,7 @@ PARSER = '/usr/sbin/apparmor_parser'
 fixture = Path(tempfile.mkdtemp(prefix='srt-apparmor-test-'))
 code = fixture / 'code'
 code.mkdir()
-for directory in ['config', 'private', '.git/hooks', 'nested', 'outside']:
+for directory in ['config', 'private', '.git/hooks', 'nested', 'outside', 'restricted']:
     (code / directory).mkdir(parents=True, exist_ok=True)
 files = {
     'normal.txt': 'normal', 'config/.env': 'secret', 'config/.env.local': 'local',
@@ -31,12 +31,14 @@ files = {
     'config/.envrc': 'envrc', 'private/secret.txt': 'private', 'private/public.txt': 'public',
     '.git/config': 'git', '.git/hooks/pre-commit': 'hook', '.bashrc': 'bashrc',
     'security_profile.json': '{}', 'nested/.env': 'authorized', 'nested/.env.local': 'authorized local',
+    '.mcp.json': '{}', 'nested/.mcp.json': '{}', 'restricted/.mcp.json': '{}',
 }
 for name, value in files.items():
     (code / name).write_text(value)
 (code / 'alias').symlink_to(code / 'config/.env')
 (code / 'private-alias').symlink_to(code / 'private', target_is_directory=True)
 (fixture / 'read-only.txt').write_text('read-only')
+(fixture / '.mcp.json').write_text('{}')
 settings = {
     'ripgrep': {'command': '/deliberately-absent-ripgrep'},
     'network': {'allowedDomains': [], 'deniedDomains': [], 'allowAllDomains': True},
@@ -45,7 +47,7 @@ settings = {
         'denyRead': [str(code / 'private'), '**/.env', '**/.env.*'],
         'allowRead': ['**/.env.example', '**/.env.example.*', '**/.env.*.example', '**/*.env.example', '**/.envrc', str(code / 'private/public.txt'), str(code / 'nested/.env'), str(code / 'nested/.env.local')],
         'allowWrite': [str(code)],
-        'denyWrite': ['**/.env', '**/.env.local', '**/.env.production', '**/security_profile.json'],
+        'denyWrite': ['**/.env', '**/.env.local', '**/.env.production', '**/security_profile.json', str(code / 'restricted/.mcp.json')],
     },
 }
 config = fixture / 'settings.json'
@@ -93,14 +95,19 @@ def check(name,allowed,fn):
     results.append({'test':name,'passed':True})
 def read(p): return lambda: pathlib.Path(p).read_text()
 def write(p): return lambda: pathlib.Path(p).write_text('updated')
-for p in ['normal.txt','config/.env.example','config/.env.example.local','config/.env.local.example','config/givetrack.env.example','config/.envrc','private/public.txt','nested/.env','nested/.env.local','.git/config','.bashrc','security_profile.json']:
+for p in ['normal.txt','config/.env.example','config/.env.example.local','config/.env.local.example','config/givetrack.env.example','config/.envrc','private/public.txt','nested/.env','nested/.env.local','.git/config','.bashrc','security_profile.json','.mcp.json','nested/.mcp.json']:
     check('read '+p,True,read(p))
-for p in ['normal.txt','config/.env.example','config/.env.example.local','config/.env.local.example','config/givetrack.env.example','config/.envrc','.git/config','new.txt']:
+for p in ['normal.txt','config/.env.example','config/.env.example.local','config/.env.local.example','config/givetrack.env.example','config/.envrc','.git/config','new.txt','.mcp.json','nested/.mcp.json']:
     check('write '+p,True,write(p))
 for p in ['config/.env','config/.env.local','config/.env.production','config/.env.surprise','private/secret.txt','alias','private-alias/secret.txt']:
     check('deny read '+p,False,read(p))
-for p in ['config/.env','config/.env.local','config/.env.production','private/secret.txt','nested/.env','nested/.env.local','.git/hooks/pre-commit','.bashrc','security_profile.json']:
+for p in ['config/.env','config/.env.local','config/.env.production','private/secret.txt','nested/.env','nested/.env.local','.git/hooks/pre-commit','.bashrc','security_profile.json','restricted/.mcp.json']:
     check('deny write '+p,False,write(p))
+(root/'plugins/example').mkdir(parents=True)
+check('create nested MCP config after launch',True,write('plugins/example/.mcp.json'))
+(root/'replacement.json').write_text('{}')
+check('atomically replace MCP config',True,lambda:os.replace('replacement.json','.mcp.json'))
+check('MCP config outside write root',False,write(root.parent/'.mcp.json'))
 check('outside write root',False,write(root.parent/'read-only.txt'))
 check('outside read remains permitted',True,read(root.parent/'read-only.txt'))
 check('mkdir ordinary directory',True,lambda:(root/'new-directory').mkdir())
@@ -262,6 +269,36 @@ print(pathlib.Path('/proc/self/attr/current').read_text().strip())
         'secret files readable only at the fixed alias directory',
         'secret alias is read-only',
     ])
+    # A worktree checkout creates versioned MCP configuration at root and nested
+    # paths. Both a sibling scratch directory and repo/.worktrees must work.
+    empty_template = fixture / 'empty-template'
+    empty_template.mkdir()
+    git = ['git', '-c', 'core.hooksPath=/dev/null', '-c', 'commit.gpgsign=false',
+           '-c', 'user.name=Sandbox Test', '-c', 'user.email=sandbox@example.invalid']
+    initialized = run([*git, 'init', '-q', f'--template={empty_template}'], cwd=other)
+    assert initialized.returncode == 0, initialized.stderr
+    mcp_paths = ['.mcp.json', 'plugins/example/.mcp.json']
+    for rel in mcp_paths:
+        path = other / rel
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text('{"mcpServers":{}}\n')
+    added = run([*git, 'add', '--', *mcp_paths], cwd=other)
+    assert added.returncode == 0, added.stderr
+    committed = run([*git, 'commit', '-qm', 'versioned MCP configuration'], cwd=other)
+    assert committed.returncode == 0, committed.stderr
+    scratch = fixture / 'scratch'
+    scratch.mkdir()
+    settings['filesystem']['allowWrite'] = [str(other), str(scratch)]
+    settings['filesystem']['secretFiles'] = []
+    config.write_text(json.dumps(settings))
+    for destination in [scratch / 'external', other / '.worktrees/inside']:
+        checkout = run([*base, '--', *git, 'worktree', 'add', '--detach', str(destination), 'HEAD'], cwd=other)
+        assert checkout.returncode == 0, checkout.stdout + checkout.stderr
+        assert (destination / '.git').is_file()
+        for rel in mcp_paths:
+            assert (destination / rel).read_text() == '{"mcpServers":{}}\n'
+        results.append({'test': f'worktree checkout with MCP configuration: {destination.relative_to(fixture)}', 'passed': True})
+
     settings['filesystem']['secretFiles'] = [str(code / 'private/secret.txt')]
     settings['filesystem']['denyRead'].append('/dev/srt/**')
     config.write_text(json.dumps(settings))

@@ -9,6 +9,8 @@ import { findFdCommand } from '../utils/fd.js'
 /**
  * Dangerous files that should be protected from writes.
  * These files can be used for code execution or data exfiltration.
+ * .mcp.json is intentionally excluded so versioned plugin configuration can be
+ * checked out and edited. Callers can still protect it with an explicit denyWrite.
  */
 export const DANGEROUS_FILES = [
   '.gitconfig',
@@ -19,7 +21,6 @@ export const DANGEROUS_FILES = [
   '.zprofile',
   '.profile',
   '.ripgreprc',
-  '.mcp.json',
 ] as const
 
 /**

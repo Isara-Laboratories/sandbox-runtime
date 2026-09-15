@@ -17,7 +17,7 @@ replacing installed CLIs; macOS and the default Linux backend are unchanged.
 ## Installation
 
 ```bash
-npm install -g https://github.com/Isara-Laboratories/sandbox-runtime/releases/download/v0.0.53-isara.3/anthropic-ai-sandbox-runtime-0.0.53-isara.3.tgz
+npm install -g https://github.com/Isara-Laboratories/sandbox-runtime/releases/download/v0.0.53-isara.5/anthropic-ai-sandbox-runtime-0.0.53-isara.5.tgz
 ```
 
 ## Basic Usage
@@ -556,13 +556,19 @@ Certain sensitive files and directories are **always blocked from writes**, even
 
 - Shell config files: `.bashrc`, `.bash_profile`, `.zshrc`, `.zprofile`, `.profile`
 - Git config files: `.gitconfig`, `.gitmodules`
-- Other sensitive files: `.ripgreprc`, `.mcp.json`
+- Other sensitive files: `.ripgreprc`
 
 **Always-blocked directories:**
 
 - IDE directories: `.vscode/`, `.idea/`
 - Claude config directories: `.claude/commands/`, `.claude/agents/`
 - Git hooks and config: `.git/hooks/`, `.git/config`
+
+`.mcp.json` is intentionally **not** auto-protected: versioned MCP plugin
+configuration must be writable during checkouts and normal development. It follows
+`allowWrite` and explicit `denyWrite` rules like an ordinary file. This weakens
+configuration-tampering protection; review changes before a trusted client loads
+them, or add an explicit `filesystem.denyWrite` rule to protect your MCP configuration.
 
 These paths are blocked automatically - you don't need to add them to `denyWrite`. For example, even with `allowWrite: ["."]`, writing to `.bashrc` or `.git/hooks/pre-commit` will fail:
 
