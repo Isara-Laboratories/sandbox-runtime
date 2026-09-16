@@ -197,6 +197,17 @@ export const FilesystemConfigSchema = z.object({
   allowWrite: z
     .array(filesystemPathSchema)
     .describe('Paths allowed for writing'),
+  repositoryProtection: z
+    .object({
+      roots: z.array(filesystemPathSchema).min(1).max(8),
+      worktreeRoots: z.array(filesystemPathSchema).max(8),
+      gitDirectories: z.array(filesystemPathSchema).max(8),
+    })
+    .strict()
+    .optional()
+    .describe(
+      'Linux AppArmor only: canonical launch checkout roots, separate untrusted worktree roots, and shared/per-worktree Git metadata directories. Config in protected roots is immutable; other writable checkouts are untrusted output.',
+    ),
   secretFiles: z
     .array(z.string())
     .optional()

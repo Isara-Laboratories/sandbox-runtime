@@ -1,5 +1,9 @@
 import shellquote from 'shell-quote'
 import { appArmorCommand, secretAliasPath } from './apparmor.js'
+import {
+  repositoryFilesystemArgs,
+  type RepositoryProtection,
+} from './repository-protection.js'
 import { logForDebugging } from '../utils/debug.js'
 import { whichSync } from '../utils/which.js'
 import { randomBytes } from 'node:crypto'
@@ -38,6 +42,7 @@ export interface LinuxSandboxParams {
   command: string
   /** Derived from the complete policy by sandbox-manager; not an arbitrary skip flag. */
   appArmorProfile?: string
+  repositoryProtection?: RepositoryProtection
   /** AppArmor mode only: host files exposed read-only under APPARMOR_SECRETS_DIR. */
   secretFiles?: string[]
   needsNetworkRestriction: boolean
@@ -705,7 +710,18 @@ async function generateFilesystemArgs(
   allowGitConfig = false,
   abortSignal?: AbortSignal,
   mandatoryDenyHandledByAppArmor = false,
+  repositoryProtection?: RepositoryProtection,
 ): Promise<string[]> {
+  if (repositoryProtection) {
+    if (
+      !mandatoryDenyHandledByAppArmor ||
+      readConfig ||
+      !writeConfig ||
+      writeConfig.denyWithinAllow.length
+    )
+      throw new Error('repositoryProtection requires AppArmor-owned deny rules')
+    return repositoryFilesystemArgs(repositoryProtection, writeConfig.allowOnly)
+  }
   const args: string[] = []
   // fs already imported
 
@@ -1071,6 +1087,7 @@ export async function wrapCommandWithSandboxLinux(
   const {
     command: originalCommand,
     appArmorProfile,
+    repositoryProtection,
     secretFiles = [],
     needsNetworkRestriction,
     httpSocketPath,
@@ -1237,6 +1254,7 @@ export async function wrapCommandWithSandboxLinux(
       allowGitConfig,
       abortSignal,
       Boolean(appArmorProfile),
+      repositoryProtection,
     )
     bwrapArgs.push(...fsArgs)
 

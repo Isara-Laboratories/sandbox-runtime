@@ -618,6 +618,13 @@ async function wrapWithSandbox(
     platform === 'linux' &&
     (customConfig?.filesystem?.linuxBackend ??
       config?.filesystem.linuxBackend) === 'apparmor'
+  const repositoryProtection =
+    customConfig?.filesystem?.repositoryProtection ??
+    config?.filesystem.repositoryProtection
+  if (repositoryProtection && !appArmorEnabled)
+    throw new Error(
+      'filesystem.repositoryProtection requires the Linux AppArmor backend',
+    )
   const filesystemPolicy = {
     denyRead:
       customConfig?.filesystem?.denyRead ?? config?.filesystem.denyRead ?? [],
@@ -633,6 +640,7 @@ async function wrapWithSandbox(
   const appArmorPolicy = appArmorEnabled
     ? compileAppArmorFilesystem({
         ...filesystemPolicy,
+        repositoryProtection,
         allowGitConfig:
           customConfig?.filesystem?.allowGitConfig ?? getAllowGitConfig(),
       })
@@ -746,6 +754,7 @@ async function wrapWithSandbox(
       return wrapCommandWithSandboxLinux({
         command,
         appArmorProfile,
+        repositoryProtection,
         secretFiles,
         needsNetworkRestriction,
         // Only pass socket paths if proxy is running (when there are domains to filter)

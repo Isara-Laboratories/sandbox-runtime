@@ -83,6 +83,13 @@ jobs:
       - name: Run Node.js fallback tests
         run: node test/utils/which-node-test.mjs
 
+      - name: Test AppArmor policy compilation
+        run: npm run test:apparmor
+
+      - name: Test repository-protection mount boundaries (Linux)
+        if: matrix.os == 'linux'
+        run: python3 test/repository-protection-linux.integration.py
+
       - name: Upload test results
         if: always()
         uses: actions/upload-artifact@v4

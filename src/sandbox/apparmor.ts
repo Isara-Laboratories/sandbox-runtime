@@ -5,6 +5,10 @@ import { homedir } from 'node:os'
 import type { FilesystemConfig } from './sandbox-config.js'
 import { getDangerousDirectories, getDangerousFiles } from './sandbox-utils.js'
 import {
+  REPOSITORY_PROTECTION_MARKER,
+  resolveRepositoryProtection,
+} from './repository-protection.js'
+import {
   complementBasename,
   complementTree,
   intersect,
@@ -21,6 +25,8 @@ export interface AppArmorPolicy {
   policy: string
   /** True when the compiled read denies cover this concrete in-sandbox path. */
   deniesRead: (concretePath: string) => boolean
+  /** AppArmor write denies only; writable-root mounts are enforced separately. */
+  deniesWrite: (concretePath: string) => boolean
 }
 const hasGlob = (s: string) => /[*?]/.test(s)
 
@@ -84,7 +90,9 @@ function normalize(raw: string): string {
 }
 
 const tree = (p: string): Pattern[] =>
-  p === '/' ? parseGlob('/**') : [...parseGlob(p), ...parseGlob(p + '/**')]
+  p === '/'
+    ? parseGlob('/**')
+    : [...parseGlob(p), ...parseGlob(p + '/'), ...parseGlob(p + '/**')]
 const quote = (s: string) => `"${s}"`
 
 function basenameSelector(
@@ -123,6 +131,9 @@ export function compileAppArmorFilesystem(
   ) {
     throw new Error('AppArmor policy exceeds safe entry limit')
   }
+  const repository = config.repositoryProtection
+    ? resolveRepositoryProtection(config.repositoryProtection)
+    : undefined
   const allowRead = [...new Set((config.allowRead ?? []).map(normalize))]
   const literalExceptions = allowRead.filter(p => !hasGlob(p))
   const globExceptions = allowRead.filter(hasGlob)
@@ -135,6 +146,7 @@ export function compileAppArmorFilesystem(
     complementBasename(selector.name) // reject unsupported shapes even if currently disjoint
   }
   const rules = new Set<string>()
+  const deniedWrite: Pattern[] = []
   const add = (patterns: Pattern[], perms: string, deny = false) => {
     for (const p of unique(patterns)) {
       // AARE collapses literal // before compiling. Intersection can produce
@@ -151,12 +163,12 @@ export function compileAppArmorFilesystem(
       )
         continue
       rules.add(`  ${deny ? 'deny ' : ''}${quote(render(p))} ${perms},`)
+      if (deny && perms.includes('w')) deniedWrite.push(p)
     }
   }
-  // The profile carries only the repository-independent rules: every deny,
-  // every read exception and the mandatory protections. Writable roots are
-  // per-launch bubblewrap mounts (read-only root plus read-write binds), so
-  // the same loaded profile serves every repository. No change_profile,
+  // The profile carries every deny, read exception, and mandatory protection,
+  // including repository scope when configured. Writable roots remain per-launch
+  // bubblewrap mounts (read-only root plus read-write binds). No change_profile,
   // mount, capability, ptrace-to-peer, or policy-management permissions.
   rules.add('  network,')
   rules.add('  signal,')
@@ -266,12 +278,63 @@ export function compileAppArmorFilesystem(
 
   // Mandatory denies are name rules, not a cwd/depth-limited scan. Include
   // future files and nested repositories at every depth.
+  const mandatoryBase = repository ? homedir() + '/' : '/**/'
   const mandatory = [
-    ...getDangerousFiles(config.allowGitConfig).map(p => '/**/' + p),
-    ...getDangerousDirectories().map(p => '/**/' + p),
-    '/**/.git/hooks',
-    ...(config.allowGitConfig ? [] : ['/**/.git/config']),
+    ...getDangerousFiles(config.allowGitConfig).map(p => mandatoryBase + p),
+    ...getDangerousDirectories().map(p => mandatoryBase + p),
+    mandatoryBase + '.git/hooks',
+    ...(config.allowGitConfig ? [] : [mandatoryBase + '.git/config']),
   ]
+  if (repository) {
+    // Work on relative patterns to keep subtraction bounded regardless of root
+    // path length. Only each root's own direct-child worktree areas are exempt:
+    // a launch checkout inside another root's worktree area stays protected.
+    const scoped = (root: string, relative: Pattern[], perms = 'wkl') => {
+      let patterns = foldCase(relative)
+      for (const scratch of repository.worktreeRoots.filter(
+        p => path.dirname(p) === root,
+      )) {
+        patterns = subtract(
+          patterns,
+          complementTree(scratch.slice(root.length)),
+        )
+      }
+      const prefix = parseGlob(root)[0]!
+      add(
+        patterns.map(p => [...prefix, ...p]),
+        perms,
+        true,
+      )
+    }
+    // Routing files can redirect a launch checkout to different configuration.
+    const gitProtected = [
+      'hooks',
+      'config',
+      'config.worktree',
+      'commondir',
+      'gitdir',
+    ]
+    for (const root of repository.roots) {
+      protectAncestors(root + '/_')
+      for (const file of [...getDangerousFiles(false), '.mcp.json'])
+        scoped(root, tree('/**/' + file))
+      for (const dir of ['.claude', '.pi', '.codex', '.vscode', '.idea'])
+        scoped(root, tree('/**/' + dir))
+      // Block changing both .git files (linked checkouts) and directory names,
+      // but leave refs, objects, indexes and new worktree administration writable.
+      scoped(root, [...parseGlob('/**/.git'), ...parseGlob('/**/.git/')])
+      for (const name of gitProtected) scoped(root, tree('/**/.git/' + name))
+    }
+    for (const git of repository.gitDirectories) {
+      for (const name of gitProtected) {
+        add(tree(git + '/' + name), 'wkl', true)
+        protectAncestors(git + '/' + name)
+      }
+    }
+    // The mount setup creates missing scratch roots before entering AppArmor.
+    for (const scratch of repository.worktreeRoots)
+      add(parseGlob(scratch + '/'), 'w', true)
+  }
   for (const p of config.denyWrite.map(normalize)) {
     add(tree(p), 'wkl', true)
     protectAncestors(p)
@@ -301,7 +364,8 @@ export function compileAppArmorFilesystem(
   return {
     name,
     deniesRead: concretePath => matchesAny(deniedRead, concretePath),
-    policy: `# Generated by srt; load as root after review. Do not use complain mode.\nprofile ${name} ${flags} {\n${body}\n}\n`,
+    deniesWrite: concretePath => matchesAny(deniedWrite, concretePath),
+    policy: `# Generated by srt; load as root after review. Do not use complain mode.\n${repository ? REPOSITORY_PROTECTION_MARKER + '\n' : ''}profile ${name} ${flags} {\n${body}\n}\n`,
   }
 }
 
