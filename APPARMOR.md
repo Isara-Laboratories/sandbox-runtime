@@ -1,12 +1,12 @@
 # Experimental Linux AppArmor filesystem backend
 
-This opt-in backend splits filesystem enforcement so that **one loaded AppArmor
-profile serves every repository**:
+This opt-in backend splits filesystem enforcement between AppArmor and mounts:
 
-- **AppArmor** enforces every rule that does not depend on the launch directory:
-  `denyRead`, `allowRead` exceptions, `denyWrite`, and the mandatory protections
-  (`.git/hooks`, shell startup files, …). Recursive selectors such as `**/.env`
-  apply system-wide. The profile name is a SHA-256 of these rules only.
+- **AppArmor** enforces `denyRead`, `allowRead` exceptions, `denyWrite`, and
+  mandatory configuration protections. Explicit recursive selectors such as
+  `**/.env` apply system-wide. Optional `repositoryProtection` scopes mandatory
+  configuration rules to the original checkout; each scope gets its own profile.
+  Without that option, mandatory name rules remain system-wide.
 - **Bubblewrap mounts** enforce `allowWrite`: a read-only root plus read-write
   binds of the literal writable roots, applied per launch without privilege.
   AppArmor forbids the sandbox from changing mounts or namespaces.
@@ -51,9 +51,11 @@ field is ignored on macOS. `--print-apparmor-profile` does not start proxies or 
 workload and does not load kernel policy.
 
 Profile names (`srt-fs-v2-<hash>`) contain a SHA-256 of the deny/exception rules,
-not of write roots, secret files, cwd, or a session ID. One load serves every
-repository and worktree. Only changed deny/exception rules, resolved symlink
-targets of literal policy paths, or compiler output require a new profile.
+not of write roots, secret files, or a session ID. Repository-protection roots
+are part of those rules: another launch checkout needs another profile. Without
+repository protection or cwd-relative rules, profiles can be shared between
+repositories. Changed rules, resolved symlink targets of literal policy paths,
+or compiler output require a new profile.
 Network-only changes never do. Manual loads last until reboot or removal; boot-time loading is not
 configured automatically. Reload a saved matching policy after reboot.
 
@@ -67,6 +69,72 @@ The compiler resolves only explicitly supplied literal paths/static prefixes. It
 does not enumerate their contents. Cold compilation/loading is a separate setup
 cost; warm launch still generates the deterministic policy/name, but skips
 `apparmor_parser` and filesystem traversal.
+
+## Original-checkout protection and untrusted worktrees
+
+From `0.0.53-isara.6`, Linux AppArmor supports an explicit policy boundary:
+
+```json
+{
+  "network": { "allowedDomains": [], "deniedDomains": [] },
+  "filesystem": {
+    "linuxBackend": "apparmor",
+    "denyRead": ["**/.env"],
+    "allowWrite": ["/repo", "/tmp"],
+    "denyWrite": [],
+    "repositoryProtection": {
+      "roots": ["/repo"],
+      "worktreeRoots": ["/repo/.worktrees"],
+      "gitDirectories": ["/repo/.git"]
+    }
+  }
+}
+```
+
+Within each protected root, at any depth except its designated worktree area:
+
+- Whole `.claude`, `.pi`, `.codex`, `.vscode`, and `.idea` trees are write-denied,
+  including settings, hook scripts, commands, and extensions.
+- Mandatory shell/Git configuration basenames and `.mcp.json` are write-denied.
+- `.git` marker files/directory names and Git `hooks`, `config`, `config.worktree`,
+  `commondir`, and `gitdir` are protected. These rules also cover every explicit
+  `gitDirectories` entry, including separate and per-worktree metadata. They
+  cannot be disabled with `allowGitConfig`; refs, objects, indexes, and new
+  worktree administration remain writable where `allowWrite` permits them.
+
+Other writable locations, including `/tmp` and `/repo/.worktrees`, are **untrusted
+output**. New checkouts can contain and edit executable configuration there.
+Explicit deny/secret rules still apply everywhere, and home-root mandatory rules
+remain. Running a trusted, non-sandboxed client from any output checkout is a
+separate trust decision; review it first. These rules do not make arbitrary source
+or build scripts safe to execute.
+
+Roots must be canonical absolute directories, not symlinks. Each worktree area
+must be a separate direct child of a protected root; it cannot overlap Git
+metadata. Preparation does not create directories. Launch creates a missing
+writable worktree-area directory with mode 0700. All boundaries receive separate
+bind mounts in parent-first order, preventing whole-directory moves between
+protected and untrusted areas (`EXDEV`) and replacement of mount roots (`EBUSY`).
+No new write permission is granted: `allowWrite` still controls writable mounts.
+An original checkout nested inside another root's worktree area is protected by
+its own root rules and mount.
+
+Isara discovers the launch checkout, main checkout, and shared/per-worktree Git
+directories, then freezes that scope on the first preparation or launch of a
+`Sandboxed` instance. Start a new instance to select another launch checkout.
+Outside Git it retains the legacy system-wide mandatory policy. Callers must
+supply accurate boundaries; SRT does not discover repositories or scan contents.
+Use `--require-repository-protection` and verify the generated
+`# srt-repository-protection-v1` marker before executing through older runtimes,
+which can silently ignore unknown options and settings. Isara does both.
+
+Pre-existing writable aliases (including bind mounts, hardlinks, and configuration
+symlinks to paths outside the protected names) require separate controls. Custom
+Git hook directories and configuration includes outside these paths need explicit
+`denyWrite` rules. Scope setup assumes no concurrent unconfined actor changes its
+paths. This is protection for selected configuration names, not their complete
+executable dependency graph or a guarantee that ordinary parent directories
+cannot be moved within the protected region.
 
 ## Which processes are confined?
 
@@ -82,9 +150,9 @@ Isara-only identity check: any otherwise permitted process can explicitly select
 the profile. See the [`aa-exec` manual](https://manpages.ubuntu.com/manpages/noble/en/man1/aa-exec.1.html)
 and [`ix` execution semantics](https://manpages.ubuntu.com/manpages/noble/en/man5/apparmor.d.5.html).
 
-Because write roots and secret files live in per-launch mounts, a named sandbox
-template such as Isara's `git` compiles to one profile for every repository,
-worktree, and `--secrets` run. Never replace a loaded profile with different rules
+Write roots and secret files live in per-launch mounts. Isara's `git` template
+reuses a profile across repeated launches and `--secrets` runs from the same
+protected checkout, but not across different launch checkouts. Never replace a loaded profile with different rules
 while workloads use it; different rules get a different hash instead.
 
 ## Policy semantics and current limitations
@@ -114,21 +182,24 @@ possible SRT glob. It supports the built-in Isara git profile and its normal
   mutation prevents renaming a secret to a readable name. A literal read carveout
   does not override any independent write deny.
 - Protected literal ancestors are immutable to prevent moving policy roots.
-  Mandatory configuration paths are protected at every depth, including future
-  files, rather than only existing paths within the old depth-limited cwd scan.
+  Mandatory configuration paths are protected at every depth in their configured
+  scope, including future files, rather than only existing paths within the old
+  depth-limited cwd scan. Directory roots have explicit trailing-slash rules;
+  a recursive descendant rule alone does not prevent renaming the directory.
 - `**/`-prefixed selectors are system-wide, stricter than the legacy
   project-local expansion. Other relative patterns still resolve against cwd
   and therefore produce per-directory profiles; prefer absolute or `**/` forms.
 - `allowWrite` entries must be literal paths (they become bind mounts). Writes
   outside them fail with `EROFS`; denies inside them are AppArmor `EACCES`.
-- `.mcp.json` is not a mandatory deny. Existing and newly checked-out MCP plugin
+- **Without `repositoryProtection`**, `.mcp.json` is not a mandatory deny. Existing and newly checked-out MCP plugin
   configuration can be edited inside writable roots, unless an explicit deny
   covers it. Review changes before loading that configuration in a trusted client.
   Git hook, shell startup file, and secret-file protections are unchanged.
 - **Creating new protected directories is denied too**, notably `.git`, `.vscode`,
   and `.idea`. Existing repositories can update normal git files (including config
   with `allowGitConfig`), but run `git init` or `git clone` on the host before
-  starting the sandbox. This prevents renaming `.git` to an unprotected name,
+  starting the sandbox, or use an untrusted area with `repositoryProtection`.
+  This prevents renaming `.git` to an unprotected name,
   changing its hooks, and moving it back. Linked worktrees can be created inside
   writable roots: their `.git` marker is a file, not a directory. Their checkout
   contents must still obey all other deny rules.
@@ -148,8 +219,10 @@ must not be removed merely to make an application work.
 
 ```
 npm run build
-node --test test/apparmor-patterns.node.test.mjs
-python3 test/apparmor-linux.integration.py
+npm run test:apparmor
+npm run test:apparmor:linux
+# Optional full committed-tree checkout, using a disposable local clone:
+python3 test/repository-protection-linux.integration.py --source-repo /path/to/repo
 python3 test/apparmor-benchmark.py --cwd /path/to/large/repo \
   --settings /path/to/real-profile.json --repeat 3 --legacy-timeout 60
 ```

@@ -17,7 +17,7 @@ replacing installed CLIs; macOS and the default Linux backend are unchanged.
 ## Installation
 
 ```bash
-npm install -g https://github.com/Isara-Laboratories/sandbox-runtime/releases/download/v0.0.53-isara.5/anthropic-ai-sandbox-runtime-0.0.53-isara.5.tgz
+npm install -g https://github.com/Isara-Laboratories/sandbox-runtime/releases/download/v0.0.53-isara.6/anthropic-ai-sandbox-runtime-0.0.53-isara.6.tgz
 ```
 
 ## Basic Usage

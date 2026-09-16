@@ -57,6 +57,10 @@ async function main(): Promise<void> {
       'use the preloaded AppArmor filesystem policy (Linux only, fail closed)',
     )
     .option(
+      '--require-repository-protection',
+      'fail unless the Linux AppArmor repository-scoped policy is configured',
+    )
+    .option(
       '--print-apparmor-profile',
       'print the AppArmor profile for these settings and cwd; do not launch',
     )
@@ -81,6 +85,7 @@ async function main(): Promise<void> {
           debug?: boolean
           apparmor?: boolean
           printApparmorProfile?: boolean
+          requireRepositoryProtection?: boolean
           settings?: string
           c?: string
           controlFd?: number
@@ -108,6 +113,14 @@ async function main(): Promise<void> {
               throw new Error('AppArmor is only available on Linux')
             runtimeConfig.filesystem.linuxBackend = 'apparmor'
           }
+          if (
+            options.requireRepositoryProtection &&
+            (runtimeConfig.filesystem.linuxBackend !== 'apparmor' ||
+              !runtimeConfig.filesystem.repositoryProtection)
+          )
+            throw new Error(
+              '--require-repository-protection requires an AppArmor repositoryProtection policy',
+            )
           if (options.printApparmorProfile) {
             process.stdout.write(
               compileAppArmorFilesystem(runtimeConfig.filesystem).policy,
