@@ -221,11 +221,15 @@ static int unix_path_is_allowed(
     if (address->sun_path[0] != '/') {
         return 0;
     }
+    /* Kernel semantics for pathname sockets: the path ends at the first NUL
+     * or at address_length, whichever comes first. Callers such as libdbus
+     * pass offsetof(sun_path) + strlen(path) without the terminator. The
+     * supervisor connects with this same copied buffer and length, so the
+     * kernel resolves exactly the path validated here. */
     const char *terminator = memchr(address->sun_path, '\0', path_capacity);
-    if (terminator == NULL) {
-        return 0;
-    }
-    size_t path_length = (size_t)(terminator - address->sun_path);
+    size_t path_length = terminator == NULL
+        ? path_capacity
+        : (size_t)(terminator - address->sun_path);
     for (size_t i = 0; i < allowlist->count; i++) {
         const char *allowed = allowlist->paths[i];
         if (strlen(allowed) == path_length && memcmp(allowed, address->sun_path, path_length) == 0) {

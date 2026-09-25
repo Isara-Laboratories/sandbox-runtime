@@ -610,7 +610,7 @@ On Linux, the sandbox uses **seccomp BPF (Berkeley Packet Filter)** to block Uni
 
 3. **Default filtering**: Without an allowlist, the BPF filter blocks `socket(AF_UNIX, ...)` with `EPERM`.
 
-4. **Path allowlisting**: With an allowlist, the filter permits Unix stream socket creation, keeps datagram and other Unix socket types blocked, and sends every `connect()` to a seccomp user-notification supervisor. The supervisor copies the tracee address, duplicates its descriptor with `pidfd_getfd`, validates an absolute pathname against the allowlist, and performs `connect()` itself. It never returns `SECCOMP_USER_NOTIF_FLAG_CONTINUE`, avoiding the tracee-memory race that would result from inspecting a path and then asking the tracee to retry the original syscall.
+4. **Path allowlisting**: With an allowlist, the filter permits Unix stream socket creation, keeps datagram and other Unix socket types blocked, and sends every `connect()` to a seccomp user-notification supervisor. The supervisor copies the tracee address, duplicates its descriptor with `pidfd_getfd`, validates an absolute pathname against the allowlist (with kernel semantics: the path ends at the first NUL or at the address length, as libdbus passes it), and performs `connect()` itself. It never returns `SECCOMP_USER_NOTIF_FLAG_CONTINUE`, avoiding the tracee-memory race that would result from inspecting a path and then asking the tracee to retry the original syscall.
 
 5. **Two-stage application using apply-seccomp binary**:
    - Outer bwrap creates the sandbox with filesystem, network, and PID namespace restrictions
