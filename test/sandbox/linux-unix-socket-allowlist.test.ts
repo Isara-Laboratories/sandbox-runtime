@@ -257,3 +257,49 @@ describe.if(isLinux)('Linux Unix socket allowlist', () => {
     expect(result.status).toBe(0)
   })
 })
+
+const keyctlProbe = [
+  'python3',
+  '-c',
+  [
+    'import ctypes, os, platform',
+    'libc = ctypes.CDLL(None, use_errno=True)',
+    // keyctl(KEYCTL_GET_KEYRING_ID, KEY_SPEC_USER_KEYRING, 0)
+    "nr = {'x86_64': 250, 'aarch64': 219}[platform.machine()]",
+    'r = libc.syscall(nr, 0, -4, 0)',
+    "print('ok' if r >= 0 else os.strerror(ctypes.get_errno()))",
+  ].join('\n'),
+]
+
+describe.if(isLinux)('Linux kernel keyring deny', () => {
+  const run = (args: string[]) =>
+    spawnSync(getApplySeccompBinaryPath()!, args, {
+      encoding: 'utf8',
+      timeout: 10000,
+    })
+
+  it('denies keyctl only when requested', () => {
+    expect(run(keyctlProbe).stdout.trim()).not.toBe('Operation not permitted')
+    const denied = run(['--deny-kernel-keyring', '--', ...keyctlProbe])
+    expect(denied.status).toBe(0)
+    expect(denied.stdout.trim()).toBe('Operation not permitted')
+  })
+
+  it('stacks with the Unix socket allowlist', () => {
+    const denied = run([
+      '--allow-unix-socket',
+      '/run/srt-test.sock',
+      '--deny-kernel-keyring',
+      '--',
+      ...keyctlProbe,
+    ])
+    expect(denied.status).toBe(0)
+    expect(denied.stdout.trim()).toBe('Operation not permitted')
+  })
+
+  it('requires -- after options', () => {
+    const result = run(['--deny-kernel-keyring', 'true'])
+    expect(result.status).not.toBe(0)
+    expect(result.stderr).toContain('expected --')
+  })
+})

@@ -3,7 +3,8 @@
  *
  * Block mode denies socket(AF_UNIX). Allowlist mode permits Unix stream socket
  * creation, denies other Unix socket types, and sends connect() to a USER_NOTIF
- * supervisor for exact-path validation and safe emulation.
+ * supervisor for exact-path validation and safe emulation. Keyring mode is an
+ * independent, stackable filter that denies the kernel keyring syscalls.
  *
  * The filter is exported in a format compatible with bubblewrap's --seccomp flag.
  *
@@ -26,7 +27,7 @@
  *   gcc -o seccomp-unix-block seccomp-unix-block.c -lseccomp
  *
  * Usage:
- *   ./seccomp-unix-block <output-file> <block|allowlist> [arch]
+ *   ./seccomp-unix-block <output-file> <block|allowlist|keyring> [arch]
  *
  * If arch is given (x86_64 or aarch64), the filter is generated for that
  * architecture instead of the native one. Lets a single-arch builder emit
@@ -57,6 +58,26 @@ static int add_io_uring_rules(scmp_filter_ctx ctx) {
         int rc = seccomp_rule_add(ctx, SCMP_ACT_ERRNO(EPERM), io_uring_calls[i], 0);
         if (rc < 0) {
             fprintf(stderr, "Error: Failed to add io_uring rule: %s\n", strerror(-rc));
+            return rc;
+        }
+    }
+    return 0;
+}
+
+/* The kernel keyring is shared by every process of the user that can reach
+ * the user/session keyrings, independent of the filesystem policy. Denying
+ * these three syscalls removes both reading existing keys and creating a
+ * sandbox-local credential store that libraries would silently fall back to. */
+static int add_keyring_rules(scmp_filter_ctx ctx) {
+    int keyring_calls[] = {
+        SCMP_SYS(add_key),
+        SCMP_SYS(request_key),
+        SCMP_SYS(keyctl),
+    };
+    for (size_t i = 0; i < sizeof(keyring_calls) / sizeof(keyring_calls[0]); i++) {
+        int rc = seccomp_rule_add(ctx, SCMP_ACT_ERRNO(EPERM), keyring_calls[i], 0);
+        if (rc < 0) {
+            fprintf(stderr, "Error: Failed to add keyring rule: %s\n", strerror(-rc));
             return rc;
         }
     }
@@ -111,14 +132,18 @@ int main(int argc, char *argv[]) {
     int rc;
 
     if (argc < 3 || argc > 4) {
-        fprintf(stderr, "Usage: %s <output-file> <block|allowlist> [x86_64|aarch64]\n", argv[0]);
+        fprintf(stderr, "Usage: %s <output-file> <block|allowlist|keyring> [x86_64|aarch64]\n", argv[0]);
         return 1;
     }
 
     const char *output_file = argv[1];
     const char *mode = argv[2];
     const char *arch_name = (argc == 4) ? argv[3] : NULL;
-    if (strcmp(mode, "block") != 0 && strcmp(mode, "allowlist") != 0) {
+    if (
+        strcmp(mode, "block") != 0 &&
+        strcmp(mode, "allowlist") != 0 &&
+        strcmp(mode, "keyring") != 0
+    ) {
         fprintf(stderr, "Error: Unsupported mode '%s'\n", mode);
         return 1;
     }
@@ -152,7 +177,9 @@ int main(int argc, char *argv[]) {
         }
     }
 
-    if (strcmp(mode, "block") == 0) {
+    if (strcmp(mode, "keyring") == 0) {
+        rc = add_keyring_rules(ctx);
+    } else if (strcmp(mode, "block") == 0) {
         /* Use a 32-bit mask because socket()'s domain argument is an int and
          * the kernel ignores the upper half of the syscall register. */
         rc = seccomp_rule_add(ctx, SCMP_ACT_ERRNO(EPERM), SCMP_SYS(socket), 1,
@@ -165,13 +192,14 @@ int main(int argc, char *argv[]) {
         return 1;
     }
 
-    /* Block io_uring entirely. IORING_OP_SOCKET (Linux 5.19+) creates sockets
+    /* Block io_uring entirely (Unix socket filters only; the keyring filter
+     * is always stacked on top of one of them). IORING_OP_SOCKET (Linux 5.19+) creates sockets
      * in kernel context without going through the socket() syscall, bypassing
      * the rule above. seccomp cannot inspect io_uring SQEs (they live in a
      * shared-memory ring), so the only safe option is to deny ring creation
      * and use. Blocking all three syscalls also covers the case of an
      * inherited ring fd. */
-    rc = add_io_uring_rules(ctx);
+    rc = strcmp(mode, "keyring") == 0 ? 0 : add_io_uring_rules(ctx);
     if (rc < 0) {
         seccomp_release(ctx);
         return 1;

@@ -1,5 +1,6 @@
 import shellquote from 'shell-quote'
 import { appArmorCommand, secretAliasPath } from './apparmor.js'
+import { sessionBusAddress } from './secret-service.js'
 import {
   repositoryFilesystemArgs,
   type RepositoryProtection,
@@ -55,6 +56,11 @@ export interface LinuxSandboxParams {
   enableWeakerNestedSandbox?: boolean
   allowUnixSockets?: string[]
   allowAllUnixSockets?: boolean
+  /**
+   * AppArmor mode only: verified session bus socket for network.allowSecretService.
+   * The caller also adds it to allowUnixSockets; this exports its address.
+   */
+  secretServiceSocket?: string
   binShell?: string
   ripgrepConfig?: { command: string; args?: string[] }
   /** Maximum directory depth to search for dangerous files (default: 3) */
@@ -623,11 +629,15 @@ function resolveApplySeccompPrefix(
   applyPath: string | undefined,
   argv0: string | undefined,
   allowUnixSockets: string[],
+  denyKernelKeyring = false,
 ): string | undefined {
   const policyArgs = allowUnixSockets.flatMap(socketPath => [
     '--allow-unix-socket',
     socketPath,
   ])
+  if (denyKernelKeyring) {
+    policyArgs.push('--deny-kernel-keyring')
+  }
   if (policyArgs.length > 0) {
     policyArgs.push('--')
   }
@@ -644,6 +654,9 @@ function resolveApplySeccompPrefix(
       throw new Error(
         'apply-seccomp with USER_NOTIF support is required for Linux allowUnixSockets',
       )
+    }
+    if (denyKernelKeyring) {
+      throw new Error('apply-seccomp is required for seccomp.denyKernelKeyring')
     }
     return undefined
   }
@@ -1099,6 +1112,7 @@ export async function wrapCommandWithSandboxLinux(
     enableWeakerNestedSandbox,
     allowUnixSockets = [],
     allowAllUnixSockets,
+    secretServiceSocket,
     binShell,
     ripgrepConfig = { command: 'rg' },
     mandatoryDenySearchDepth = DEFAULT_MANDATORY_DENY_SEARCH_DEPTH,
@@ -1118,6 +1132,15 @@ export async function wrapCommandWithSandboxLinux(
   const hasWriteRestrictions = writeConfig !== undefined
   const hasUnixSocketAllowlist =
     !allowAllUnixSockets && allowUnixSockets.length > 0
+  const denyKernelKeyring = seccompConfig?.denyKernelKeyring === true
+  if (secretServiceSocket && !appArmorProfile)
+    throw new Error(
+      'network.allowSecretService requires the Linux AppArmor backend',
+    )
+  if (denyKernelKeyring && allowAllUnixSockets)
+    throw new Error(
+      'seccomp.denyKernelKeyring requires apply-seccomp, which allowAllUnixSockets disables',
+    )
 
   // Check if we need any sandboxing
   if (
@@ -1125,7 +1148,8 @@ export async function wrapCommandWithSandboxLinux(
     !hasReadRestrictions &&
     !hasWriteRestrictions &&
     !appArmorProfile &&
-    !hasUnixSocketAllowlist
+    !hasUnixSocketAllowlist &&
+    !denyKernelKeyring
   ) {
     return command
   }
@@ -1152,6 +1176,7 @@ export async function wrapCommandWithSandboxLinux(
         seccompConfig?.applyPath,
         seccompConfig?.argv0,
         normalizedUnixSockets,
+        denyKernelKeyring,
       )
 
       if (!applySeccompPrefix) {
@@ -1261,6 +1286,15 @@ export async function wrapCommandWithSandboxLinux(
     // Always bind /dev
     bwrapArgs.push('--dev', '/dev')
 
+    // The launcher may have scrubbed the bus address; export the verified one.
+    if (secretServiceSocket) {
+      bwrapArgs.push(
+        '--setenv',
+        'DBUS_SESSION_BUS_ADDRESS',
+        sessionBusAddress(secretServiceSocket),
+      )
+    }
+
     if (secretFiles.length) {
       if (!appArmorProfile)
         throw new Error('secretFiles require the AppArmor backend')
@@ -1345,7 +1379,9 @@ export async function wrapCommandWithSandboxLinux(
           ? 'seccomp(unix-allowlist)'
           : 'seccomp(unix-block)',
       )
+      if (denyKernelKeyring) restrictions.push('seccomp(keyring-deny)')
     }
+    if (secretServiceSocket) restrictions.push('dbus(secret-service)')
 
     logForDebugging(
       `[Sandbox Linux] Wrapped command with bwrap (${restrictions.join(', ')} restrictions)`,
