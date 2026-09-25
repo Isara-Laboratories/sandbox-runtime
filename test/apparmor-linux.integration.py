@@ -317,6 +317,72 @@ print(pathlib.Path('/proc/self/attr/current').read_text().strip())
     config.write_text(json.dumps(settings))
     unload(profile)
 
+    # Secret Service over the session bus: only with a running provider. Calls
+    # that must be denied use harmless arguments (nonexistent collection, empty
+    # lock list), so a broken policy could not damage a real keyring.
+    has_provider = subprocess.run(
+        ['dbus-send', '--session', '--print-reply', '--dest=org.freedesktop.DBus', '/org/freedesktop/DBus',
+         'org.freedesktop.DBus.NameHasOwner', 'string:org.freedesktop.secrets'],
+        env=env, text=True, capture_output=True, timeout=10)
+    if has_provider.returncode != 0 or 'boolean true' not in has_provider.stdout:
+        results.append({'test': 'Secret Service D-Bus policy (skipped: no provider on the session bus)', 'passed': True})
+    else:
+        settings['network']['allowSecretService'] = True
+        settings['seccomp'] = {'denyKernelKeyring': True}
+        config.write_text(json.dumps(settings))
+        ss_generated = run([*base, '--print-apparmor-profile'])
+        assert ss_generated.returncode == 0, ss_generated.stderr
+        assert 'dbus send bus=session' in ss_generated.stdout
+        ss_profile = fixture / 'secret-service.apparmor'
+        ss_profile.write_text(ss_generated.stdout)
+        unverified = run([*base, '--', '/bin/sh', '-c', 'touch should-not-run'])
+        assert unverified.returncode != 0 and not (code / 'should-not-run').exists()
+        assert 'could not verify AppArmor D-Bus mediation' in unverified.stderr, unverified.stderr
+        results.append({'test': 'Secret Service fails closed without a loaded mediating profile', 'passed': True})
+        load(ss_profile)
+        ss_probe = run([*base, '--', '/usr/bin/python3', '-c', r'''
+import ctypes, os, platform, subprocess
+assert os.environ['DBUS_SESSION_BUS_ADDRESS'].startswith('unix:path=')
+def send(*args, dest='org.freedesktop.DBus', path='/org/freedesktop/DBus'):
+    return subprocess.run(['dbus-send', '--session', '--print-reply', f'--dest={dest}', path, *args],
+                          capture_output=True, text=True, timeout=10)
+def allowed(name, result):
+    assert result.returncode == 0, (name, result.stderr)
+def denied(name, result):
+    assert result.returncode > 0 and 'AccessDenied' in result.stderr and 'AppArmor' in result.stderr, (name, result.stdout, result.stderr)
+# dbus-send uses libdbus, which connects without a NUL in the address length.
+allowed('resolve provider', send('org.freedesktop.DBus.GetNameOwner', 'string:org.freedesktop.secrets'))
+allowed('list names', send('org.freedesktop.DBus.ListNames'))
+allowed('read collections', send('org.freedesktop.DBus.Properties.Get', 'string:org.freedesktop.Secret.Service',
+        'string:Collections', dest='org.freedesktop.secrets', path='/org/freedesktop/secrets'))
+denied('monitor the bus', send('org.freedesktop.DBus.Monitoring.BecomeMonitor', 'array:string:', 'uint32:0'))
+denied('change activation environment', send('org.freedesktop.DBus.UpdateActivationEnvironment', 'dict:string:string:SRT_TEST,1'))
+denied('own a name', send('org.freedesktop.DBus.RequestName', 'string:org.example.SrtTest', 'uint32:0'))
+denied('bus driver through secrets path', send('org.freedesktop.DBus.GetId', path='/org/freedesktop/secrets'))
+denied('systemd user manager', send('org.freedesktop.DBus.Peer.Ping', dest='org.freedesktop.systemd1', path='/org/freedesktop/systemd1'))
+denied('delete a collection', send('org.freedesktop.Secret.Collection.Delete', dest='org.freedesktop.secrets',
+       path='/org/freedesktop/secrets/collection/srt_integration_nonexistent'))
+denied('lock collections', send('org.freedesktop.Secret.Service.Lock', 'array:objpath:',
+       dest='org.freedesktop.secrets', path='/org/freedesktop/secrets'))
+libc = ctypes.CDLL(None, use_errno=True)
+nr = {'x86_64': 250, 'aarch64': 219}[platform.machine()]
+assert libc.syscall(nr, 0, -4, 0) == -1 and ctypes.get_errno() == 1, 'kernel keyring reachable'
+print(open('/proc/self/attr/current').read().strip())
+'''])
+        assert ss_probe.returncode == 0, ss_probe.stdout + ss_probe.stderr
+        assert ss_probe.stdout.strip().endswith('(enforce)')
+        results.extend({'test': t, 'passed': True} for t in [
+            'Secret Service reachable through libdbus (no NUL in address length)',
+            'bus monitoring, activation environment, name ownership and systemd denied',
+            'bus-driver calls through the secrets path denied',
+            'collection deletion and locking denied',
+            'kernel keyring syscalls denied',
+        ])
+        unload(ss_profile)
+        settings['network'].pop('allowSecretService')
+        settings.pop('seccomp')
+        config.write_text(json.dumps(settings))
+
     complain = fixture / 'complain.apparmor'
     complain.write_text(profile.read_text().replace('flags=(attach_disconnected,mediate_deleted)', 'flags=(complain,attach_disconnected,mediate_deleted)'))
     load(complain)

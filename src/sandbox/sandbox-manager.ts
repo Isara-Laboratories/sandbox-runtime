@@ -1,4 +1,8 @@
 import { compileAppArmorFilesystem, secretAliasPath } from './apparmor.js'
+import {
+  resolveSessionBusSocket,
+  verifySecretServiceMediation,
+} from './secret-service.js'
 import { createHttpProxyServer } from './http-proxy.js'
 import { createSocksProxyServer } from './socks-proxy.js'
 import type { SocksProxyWrapper } from './socks-proxy.js'
@@ -625,6 +629,15 @@ async function wrapWithSandbox(
     throw new Error(
       'filesystem.repositoryProtection requires the Linux AppArmor backend',
     )
+  // Linux-only; like linuxBackend, ignored on macOS.
+  const secretService =
+    platform === 'linux' &&
+    (customConfig?.network?.allowSecretService ??
+      config?.network?.allowSecretService) === true
+  if (secretService && !appArmorEnabled)
+    throw new Error(
+      'network.allowSecretService requires the Linux AppArmor backend (bubblewrap cannot mediate D-Bus)',
+    )
   const filesystemPolicy = {
     denyRead:
       customConfig?.filesystem?.denyRead ?? config?.filesystem.denyRead ?? [],
@@ -638,14 +651,22 @@ async function wrapWithSandbox(
       customConfig?.filesystem?.denyWrite ?? config?.filesystem.denyWrite ?? [],
   }
   const appArmorPolicy = appArmorEnabled
-    ? compileAppArmorFilesystem({
-        ...filesystemPolicy,
-        repositoryProtection,
-        allowGitConfig:
-          customConfig?.filesystem?.allowGitConfig ?? getAllowGitConfig(),
-      })
+    ? compileAppArmorFilesystem(
+        {
+          ...filesystemPolicy,
+          repositoryProtection,
+          allowGitConfig:
+            customConfig?.filesystem?.allowGitConfig ?? getAllowGitConfig(),
+        },
+        { secretService },
+      )
     : undefined
   const appArmorProfile = appArmorPolicy?.name
+  let secretServiceSocket: string | undefined
+  if (secretService && appArmorProfile) {
+    secretServiceSocket = resolveSessionBusSocket()
+    verifySecretServiceMediation(appArmorProfile, secretServiceSocket)
+  }
   // AppArmor mode: the profile holds every deny/exception rule; bwrap binds
   // the literal writable roots per launch, without any glob expansion scan.
   if (appArmorEnabled) {
@@ -773,8 +794,12 @@ async function wrapWithSandbox(
         readConfig,
         writeConfig,
         enableWeakerNestedSandbox: getEnableWeakerNestedSandbox(),
-        allowUnixSockets: getAllowUnixSockets(),
+        allowUnixSockets: [
+          ...(getAllowUnixSockets() ?? []),
+          ...(secretServiceSocket ? [secretServiceSocket] : []),
+        ],
         allowAllUnixSockets: getAllowAllUnixSockets(),
+        secretServiceSocket,
         binShell,
         ripgrepConfig: getRipgrepConfig(),
         mandatoryDenySearchDepth: getMandatoryDenySearchDepth(),

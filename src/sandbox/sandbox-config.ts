@@ -126,6 +126,15 @@ export const NetworkConfigSchema = z.object({
     .describe(
       'If true, allow all Unix sockets (disables blocking on both platforms).',
     ),
+  allowSecretService: z
+    .boolean()
+    .optional()
+    .describe(
+      'Linux AppArmor backend only: expose the D-Bus session bus socket, confined by AppArmor D-Bus ' +
+        'rules to the freedesktop Secret Service API (org.freedesktop.secrets) and nothing else on the bus. ' +
+        'The workload can read every item in unlocked collections. Refuses to start unless the bus ' +
+        'daemon verifiably enforces the rules. Ignored on macOS.',
+    ),
   allowLocalBinding: z
     .boolean()
     .optional()
@@ -260,6 +269,13 @@ export const RipgrepConfigSchema = z.object({
  */
 export const SeccompConfigSchema = z.object({
   applyPath: z.string().optional().describe('Path to the apply-seccomp binary'),
+  denyKernelKeyring: z
+    .boolean()
+    .optional()
+    .describe(
+      'Deny the kernel keyring syscalls (add_key, request_key, keyctl) inside the sandbox. ' +
+        'Requires apply-seccomp; incompatible with allowAllUnixSockets.',
+    ),
   argv0: z
     .string()
     .optional()

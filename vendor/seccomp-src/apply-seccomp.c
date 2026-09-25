@@ -1,13 +1,14 @@
 /*
  * apply-seccomp.c - Apply seccomp BPF filter in an isolated PID namespace
  *
- * Usage: apply-seccomp [--allow-unix-socket /absolute/path ... --] <command> [args...]
+ * Usage: apply-seccomp [--allow-unix-socket /absolute/path ...] [--deny-kernel-keyring] [--] <command> [args...]
  *
  * This program applies a baked-in seccomp BPF filter and isolates the target
  * command in a nested user+PID+mount namespace so it cannot see or ptrace any
  * process that lacks the filter. With an allowlist, connect() is trapped to
  * the outer stub, which safely emulates the call from supervisor-owned copies
- * of the tracee descriptor and sockaddr.
+ * of the tracee descriptor and sockaddr. --deny-kernel-keyring stacks a second
+ * baked-in filter that denies add_key, request_key, and keyctl.
  *
  * Process layout inside the outer bwrap sandbox:
  *
@@ -99,16 +100,33 @@ struct unix_socket_allowlist {
     size_t count;
 };
 
+struct seccomp_options {
+    struct unix_socket_allowlist allowlist;
+    int deny_kernel_keyring;
+};
+
 static int parse_command(
     int argc,
     char *argv[],
-    struct unix_socket_allowlist *allowlist,
+    struct seccomp_options *options,
     char ***command_argv
 ) {
     int i = 1;
-    memset(allowlist, 0, sizeof(*allowlist));
+    int saw_option = 0;
+    struct unix_socket_allowlist *allowlist = &options->allowlist;
+    memset(options, 0, sizeof(*options));
 
-    while (i < argc && strcmp(argv[i], "--allow-unix-socket") == 0) {
+    while (i < argc) {
+        if (strcmp(argv[i], "--deny-kernel-keyring") == 0) {
+            options->deny_kernel_keyring = 1;
+            saw_option = 1;
+            i++;
+            continue;
+        }
+        if (strcmp(argv[i], "--allow-unix-socket") != 0) {
+            break;
+        }
+        saw_option = 1;
         if (i + 1 >= argc) {
             fprintf(stderr, "apply-seccomp: --allow-unix-socket requires a path\n");
             return -1;
@@ -127,7 +145,7 @@ static int parse_command(
         i += 2;
     }
 
-    if (allowlist->count > 0) {
+    if (saw_option) {
         if (i >= argc || strcmp(argv[i], "--") != 0) {
             fprintf(stderr, "apply-seccomp: expected -- before the command\n");
             return -1;
@@ -138,7 +156,7 @@ static int parse_command(
     }
 
     if (i >= argc) {
-        fprintf(stderr, "Usage: %s [--allow-unix-socket /absolute/path ... --] <command> [args...]\n", argv[0]);
+        fprintf(stderr, "Usage: %s [--allow-unix-socket /absolute/path ...] [--deny-kernel-keyring] [--] <command> [args...]\n", argv[0]);
         return -1;
     }
     *command_argv = &argv[i];
@@ -221,11 +239,15 @@ static int unix_path_is_allowed(
     if (address->sun_path[0] != '/') {
         return 0;
     }
+    /* Kernel semantics for pathname sockets: the path ends at the first NUL
+     * or at address_length, whichever comes first. Callers such as libdbus
+     * pass offsetof(sun_path) + strlen(path) without the terminator. The
+     * supervisor connects with this same copied buffer and length, so the
+     * kernel resolves exactly the path validated here. */
     const char *terminator = memchr(address->sun_path, '\0', path_capacity);
-    if (terminator == NULL) {
-        return 0;
-    }
-    size_t path_length = (size_t)(terminator - address->sun_path);
+    size_t path_length = terminator == NULL
+        ? path_capacity
+        : (size_t)(terminator - address->sun_path);
     for (size_t i = 0; i < allowlist->count; i++) {
         const char *allowed = allowlist->paths[i];
         if (strlen(allowed) == path_length && memcmp(allowed, address->sun_path, path_length) == 0) {
@@ -553,16 +575,19 @@ static int reap_until(pid_t main_child) {
 }
 
 int main(int argc, char *argv[]) {
-    struct unix_socket_allowlist allowlist;
+    struct seccomp_options options;
     char **command_argv = NULL;
-    if (parse_command(argc, argv, &allowlist, &command_argv) < 0) {
+    if (parse_command(argc, argv, &options, &command_argv) < 0) {
         return 1;
     }
+    struct unix_socket_allowlist allowlist = options.allowlist;
 
     _Static_assert(sizeof(unix_block_bpf) % sizeof(struct sock_filter) == 0,
                    "BPF filter size must be a multiple of sock_filter");
     _Static_assert(sizeof(unix_allowlist_bpf) % sizeof(struct sock_filter) == 0,
                    "allowlist BPF filter size must be a multiple of sock_filter");
+    _Static_assert(sizeof(keyring_block_bpf) % sizeof(struct sock_filter) == 0,
+                   "keyring BPF filter size must be a multiple of sock_filter");
     struct sock_fprog block_program = {
         .len = (unsigned short)(sizeof(unix_block_bpf) / sizeof(struct sock_filter)),
         .filter = (struct sock_filter *)unix_block_bpf,
@@ -570,6 +595,10 @@ int main(int argc, char *argv[]) {
     struct sock_fprog allowlist_program = {
         .len = (unsigned short)(sizeof(unix_allowlist_bpf) / sizeof(struct sock_filter)),
         .filter = (struct sock_filter *)unix_allowlist_bpf,
+    };
+    struct sock_fprog keyring_program = {
+        .len = (unsigned short)(sizeof(keyring_block_bpf) / sizeof(struct sock_filter)),
+        .filter = (struct sock_filter *)keyring_block_bpf,
     };
 
     int notification_pair[2] = { -1, -1 };
@@ -727,6 +756,14 @@ int main(int argc, char *argv[]) {
     /* ---- Worker (inner PID 2): apply seccomp and exec. ---- */
     if (prctl(PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) < 0) {
         die("apply-seccomp: prctl(PR_SET_NO_NEW_PRIVS)");
+    }
+    /* Stacked filters: the kernel applies the most restrictive action, so the
+     * keyring denies compose with either Unix socket policy below. */
+    if (
+        options.deny_kernel_keyring &&
+        prctl(PR_SET_SECCOMP, SECCOMP_MODE_FILTER, &keyring_program) < 0
+    ) {
+        die("apply-seccomp: prctl(PR_SET_SECCOMP keyring)");
     }
     if (allowlist.count > 0) {
         install_allowlist_filter(&allowlist_program, notification_pair[1]);

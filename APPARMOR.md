@@ -155,6 +155,60 @@ reuses a profile across repeated launches and `--secrets` runs from the same
 protected checkout, but not across different launch checkouts. Never replace a loaded profile with different rules
 while workloads use it; different rules get a different hash instead.
 
+## Secret Service over D-Bus
+
+`network.allowSecretService: true` (AppArmor backend only) exposes the D-Bus
+session bus socket and adds D-Bus rules to the generated profile. With D-Bus
+mediation, the bus daemon denies every message a confined client sends unless
+a rule allows it. Without this setting, profiles contain no D-Bus rules, so a
+reachable bus socket (for example via `allowAllUnixSockets`) is still unusable.
+
+The rules allow:
+
+- the `dbus-session-strict` bus-driver calls (`Hello`, `AddMatch`,
+  `RemoveMatch`, `GetNameOwner`, `NameHasOwner`, `StartServiceByName`) plus
+  `ListNames`, which keyring-rs uses to detect the provider;
+- the Secret Service interfaces (`org.freedesktop.Secret.*`), plus
+  `Properties` and `Introspectable`, under `/org/freedesktop/secrets`, sent to
+  and received from unconfined peers.
+
+This follows snapd's `password-manager-service` interface, with one
+difference: snapd also allows `org.freedesktop.DBus.*` on those paths. The bus
+daemon is itself an unconfined peer and ignores the object path for most of its
+own methods, so that wildcard would reopen bus-driver calls through the
+Secret Service path. Clients such as libsecret address the provider by its
+unique connection name, which is why the peer is matched by label rather than
+by `org.freedesktop.secrets`.
+
+Deny rules remove destructive collection-wide calls: `Collection.Delete`,
+`Service.Lock`, `Service.SetAlias`, and `Service.CreateCollection`. Everything
+else on the bus is denied, including `systemd --user`,
+`UpdateActivationEnvironment`, `BecomeMonitor`, `RequestName`, and
+eavesdropping.
+
+`StartServiceByName` cannot be limited to the Secret Service: the bus daemon
+does not check the activated name, and AppArmor does not inspect arguments. A
+workload can start any installed activatable service, but cannot talk to it
+afterwards or change its environment. To keep that from becoming an escape,
+the profile also write-denies the D-Bus service and systemd user unit
+directories (`$XDG_RUNTIME_DIR/{dbus-1,systemd}`,
+`~/.local/share/{dbus-1,systemd}`, `~/.config/systemd`, and their `XDG_*`
+overrides), regardless of `allowWrite`.
+
+**Trust boundary:** the Secret Service has no per-client access control. The
+workload can read, create, update, and delete any item in any unlocked
+collection, including items stored by other applications.
+
+**Fail closed:** before each launch, srt runs `dbus-send` under the loaded
+profile and calls a bus method the rules do not allow (`GetId`). Unless the bus
+replies with an AppArmor `AccessDenied`, srt refuses to start. This catches a
+bus daemon without AppArmor support, `<apparmor mode="disabled"/>`, and a
+parser feature set without D-Bus mediation. `dbus-send` must be installed.
+
+Combine it with `seccomp.denyKernelKeyring`: credential libraries fall back to
+the kernel keyring, silently, when the Secret Service is unreachable, and the
+kernel keyring is otherwise shared with the sandbox.
+
 ## Policy semantics and current limitations
 
 This is a bounded experimental compiler, not a drop-in implementation of every

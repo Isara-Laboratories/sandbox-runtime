@@ -17,7 +17,7 @@ replacing installed CLIs; macOS and the default Linux backend are unchanged.
 ## Installation
 
 ```bash
-npm install -g https://github.com/Isara-Laboratories/sandbox-runtime/releases/download/v0.0.53-isara.6/anthropic-ai-sandbox-runtime-0.0.53-isara.6.tgz
+npm install -g https://github.com/Isara-Laboratories/sandbox-runtime/releases/download/v0.0.53-isara.7/anthropic-ai-sandbox-runtime-0.0.53-isara.7.tgz
 ```
 
 ## Basic Usage
@@ -298,6 +298,9 @@ Uses an **allow-only pattern** - all network access is denied by default.
 | ------------------------------ | ------------------------- | ---------------------------------- |
 | `allowUnixSockets: string[]`   | Allowlist of socket paths | Exact stream-socket connect paths  |
 | `allowAllUnixSockets: boolean` | Allow all sockets         | Disable seccomp blocking           |
+| `allowSecretService: boolean`  | Ignored                   | Session bus, confined by AppArmor to the Secret Service API (AppArmor backend only) |
+
+**Secret Service (Linux, AppArmor backend):** `network.allowSecretService` lets the workload use the freedesktop Secret Service (gnome-keyring, KeePassXC) over the D-Bus session bus, and nothing else on that bus. srt resolves the bus socket (`DBUS_SESSION_BUS_ADDRESS`, else `$XDG_RUNTIME_DIR/bus`, else `/run/user/<uid>/bus`), adds it to the Unix socket allowlist, exports `DBUS_SESSION_BUS_ADDRESS`, and adds AppArmor D-Bus rules to the profile. It refuses to start unless a confined probe proves that the bus daemon enforces those rules. The Secret Service API has no per-client access control: the workload can read every item in every unlocked collection. See [APPARMOR.md](APPARMOR.md#secret-service-over-d-bus).
 
 Unix sockets are **blocked by default** on both platforms.
 
@@ -362,6 +365,7 @@ block creation of a known path.
 
 - `ignoreViolations` - Object mapping command patterns to arrays of paths where violations should be ignored
 - `enableWeakerNestedSandbox` - Enable weaker sandbox mode for Docker environments (boolean, default: false)
+- `seccomp.denyKernelKeyring` - Linux: deny the kernel keyring syscalls (`add_key`, `request_key`, `keyctl`) with `EPERM` (boolean, default: false). Requires `apply-seccomp`; incompatible with `allowAllUnixSockets`. The user and session keyrings are shared across processes regardless of filesystem policy, and credential libraries silently fall back to them when the Secret Service is unreachable.
 - `enableWeakerNetworkIsolation` - Allow access to `com.apple.trustd.agent` in the macOS sandbox (boolean, default: false). This is needed for Go programs (`gh`, `gcloud`, `terraform`, `kubectl`, etc.) to verify TLS certificates when using `httpProxyPort` with a MITM proxy and custom CA. **Security warning:** enabling this opens a potential data exfiltration vector through the trustd service.
 
 ### Common Configuration Recipes
@@ -610,7 +614,7 @@ On Linux, the sandbox uses **seccomp BPF (Berkeley Packet Filter)** to block Uni
 
 3. **Default filtering**: Without an allowlist, the BPF filter blocks `socket(AF_UNIX, ...)` with `EPERM`.
 
-4. **Path allowlisting**: With an allowlist, the filter permits Unix stream socket creation, keeps datagram and other Unix socket types blocked, and sends every `connect()` to a seccomp user-notification supervisor. The supervisor copies the tracee address, duplicates its descriptor with `pidfd_getfd`, validates an absolute pathname against the allowlist, and performs `connect()` itself. It never returns `SECCOMP_USER_NOTIF_FLAG_CONTINUE`, avoiding the tracee-memory race that would result from inspecting a path and then asking the tracee to retry the original syscall.
+4. **Path allowlisting**: With an allowlist, the filter permits Unix stream socket creation, keeps datagram and other Unix socket types blocked, and sends every `connect()` to a seccomp user-notification supervisor. The supervisor copies the tracee address, duplicates its descriptor with `pidfd_getfd`, validates an absolute pathname against the allowlist (with kernel semantics: the path ends at the first NUL or at the address length, as libdbus passes it), and performs `connect()` itself. It never returns `SECCOMP_USER_NOTIF_FLAG_CONTINUE`, avoiding the tracee-memory race that would result from inspecting a path and then asking the tracee to retry the original syscall.
 
 5. **Two-stage application using apply-seccomp binary**:
    - Outer bwrap creates the sandbox with filesystem, network, and PID namespace restrictions
@@ -619,6 +623,8 @@ On Linux, the sandbox uses **seccomp BPF (Berkeley Packet Filter)** to block Uni
    - Inside the nested namespace, apply-seccomp acts as PID 1 (non-dumpable init/reaper)
    - apply-seccomp forks, applies the selected filter, and execs the user command
    - In allowlist mode, the unfiltered outer stub supervises trapped connects
+
+6. **Kernel keyring deny** (`seccomp.denyKernelKeyring`): a second baked-in filter, stacked on either Unix socket filter, returns `EPERM` for `add_key`, `request_key`, and `keyctl`.
 
 **PID namespace isolation**: The nested PID namespace ensures the user command cannot see or address any process that runs without the seccomp filter (bwrap's init, the shell wrapper, or the socat helpers). This keeps the seccomp boundary intact regardless of `kernel.yama.ptrace_scope`, since unfiltered helpers are not reachable via `ptrace` or `/proc/N/mem`. The inner PID 1 sets `PR_SET_DUMPABLE=0` so it is not ptraceable either. If nested namespace creation fails, apply-seccomp aborts rather than running without isolation.
 

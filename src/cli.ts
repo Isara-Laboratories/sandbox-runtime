@@ -123,7 +123,10 @@ async function main(): Promise<void> {
             )
           if (options.printApparmorProfile) {
             process.stdout.write(
-              compileAppArmorFilesystem(runtimeConfig.filesystem).policy,
+              compileAppArmorFilesystem(runtimeConfig.filesystem, {
+                secretService:
+                  runtimeConfig.network.allowSecretService === true,
+              }).policy,
             )
             return
           }

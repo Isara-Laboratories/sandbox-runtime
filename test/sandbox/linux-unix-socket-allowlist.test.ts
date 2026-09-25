@@ -117,6 +117,47 @@ describe.if(isLinux)('Linux Unix socket allowlist', () => {
     },
   )
 
+  // libdbus passes offsetof(sun_path) + strlen(path) without the NUL; the
+  // kernel accepts that, so the supervisor must resolve the same path.
+  const connectWithoutTerminator = (target: string) =>
+    runWithAllowlist([
+      'python3',
+      '-c',
+      [
+        'import ctypes, os, socket, sys',
+        'libc = ctypes.CDLL(None, use_errno=True)',
+        'path = sys.argv[1].encode()',
+        'class Sun(ctypes.Structure):',
+        '    _fields_ = [("family", ctypes.c_ushort), ("path", ctypes.c_char * 108)]',
+        'sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)',
+        'addr = Sun(socket.AF_UNIX, path)',
+        'if libc.connect(sock.fileno(), ctypes.byref(addr), 2 + len(path)) != 0:',
+        '    sys.exit(os.strerror(ctypes.get_errno()))',
+      ].join('\n'),
+      target,
+    ])
+
+  it.if(hostSupportsUnixSockets)(
+    'accepts an allowed path passed without a NUL terminator (libdbus)',
+    () => {
+      const result = connectWithoutTerminator(ALLOWED_SOCKET)
+      expect(result.stderr).toBe('')
+      expect(result.status).toBe(0)
+    },
+  )
+
+  it.if(hostSupportsUnixSockets)(
+    'still blocks other paths passed without a NUL terminator',
+    () => {
+      const result = connectWithoutTerminator(DENIED_SOCKET)
+      expect(result.status).not.toBe(0)
+      expect(result.stderr.toLowerCase()).toMatch(/operation not permitted/)
+      // A prefix of the allowed path must not match either.
+      const prefix = connectWithoutTerminator(ALLOWED_SOCKET.slice(0, -1))
+      expect(prefix.status).not.toBe(0)
+    },
+  )
+
   it('blocks relative and abstract Unix socket addresses', () => {
     const relative = connectTo('relative.sock')
     expect(relative.status).not.toBe(0)
@@ -214,5 +255,51 @@ describe.if(isLinux)('Linux Unix socket allowlist', () => {
       String(tcpPort),
     ])
     expect(result.status).toBe(0)
+  })
+})
+
+const keyctlProbe = [
+  'python3',
+  '-c',
+  [
+    'import ctypes, os, platform',
+    'libc = ctypes.CDLL(None, use_errno=True)',
+    // keyctl(KEYCTL_GET_KEYRING_ID, KEY_SPEC_USER_KEYRING, 0)
+    "nr = {'x86_64': 250, 'aarch64': 219}[platform.machine()]",
+    'r = libc.syscall(nr, 0, -4, 0)',
+    "print('ok' if r >= 0 else os.strerror(ctypes.get_errno()))",
+  ].join('\n'),
+]
+
+describe.if(isLinux)('Linux kernel keyring deny', () => {
+  const run = (args: string[]) =>
+    spawnSync(getApplySeccompBinaryPath()!, args, {
+      encoding: 'utf8',
+      timeout: 10000,
+    })
+
+  it('denies keyctl only when requested', () => {
+    expect(run(keyctlProbe).stdout.trim()).not.toBe('Operation not permitted')
+    const denied = run(['--deny-kernel-keyring', '--', ...keyctlProbe])
+    expect(denied.status).toBe(0)
+    expect(denied.stdout.trim()).toBe('Operation not permitted')
+  })
+
+  it('stacks with the Unix socket allowlist', () => {
+    const denied = run([
+      '--allow-unix-socket',
+      '/run/srt-test.sock',
+      '--deny-kernel-keyring',
+      '--',
+      ...keyctlProbe,
+    ])
+    expect(denied.status).toBe(0)
+    expect(denied.stdout.trim()).toBe('Operation not permitted')
+  })
+
+  it('requires -- after options', () => {
+    const result = run(['--deny-kernel-keyring', 'true'])
+    expect(result.status).not.toBe(0)
+    expect(result.stderr).toContain('expected --')
   })
 })

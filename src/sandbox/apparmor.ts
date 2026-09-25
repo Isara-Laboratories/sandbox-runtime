@@ -5,6 +5,10 @@ import { homedir } from 'node:os'
 import type { FilesystemConfig } from './sandbox-config.js'
 import { getDangerousDirectories, getDangerousFiles } from './sandbox-utils.js'
 import {
+  SECRET_SERVICE_APPARMOR_RULES,
+  secretServiceDenyWrite,
+} from './secret-service.js'
+import {
   REPOSITORY_PROTECTION_MARKER,
   resolveRepositoryProtection,
 } from './repository-protection.js'
@@ -118,8 +122,14 @@ function basenameSelector(
  * can reopen such a child. Bracket globs/non-ASCII paths and complex read-exception
  * expressions are rejected, not silently dropped. See the backend README.
  */
+export interface AppArmorPolicyOptions {
+  /** Add the D-Bus rules for network.allowSecretService. */
+  secretService?: boolean
+}
+
 export function compileAppArmorFilesystem(
   config: FilesystemConfig,
+  options: AppArmorPolicyOptions = {},
 ): AppArmorPolicy {
   if (
     [
@@ -335,7 +345,11 @@ export function compileAppArmorFilesystem(
     for (const scratch of repository.worktreeRoots)
       add(parseGlob(scratch + '/'), 'w', true)
   }
-  for (const p of config.denyWrite.map(normalize)) {
+  const denyWrite = [
+    ...config.denyWrite,
+    ...(options.secretService ? secretServiceDenyWrite() : []),
+  ]
+  for (const p of denyWrite.map(normalize)) {
     add(tree(p), 'wkl', true)
     protectAncestors(p)
   }
@@ -349,6 +363,10 @@ export function compileAppArmorFilesystem(
   rules.add('  deny "/proc/**" wkl,')
   rules.add('  deny "/sys/**" wkl,')
   rules.add('  deny "/proc/*/mem" rw,')
+  // Without D-Bus rules, a profile compiled with D-Bus mediation denies every
+  // bus message. These add exactly the Secret Service API (see secret-service.ts).
+  if (options.secretService)
+    for (const rule of SECRET_SERVICE_APPARMOR_RULES) rules.add(rule)
   // attach_disconnected: bwrap supplies a fresh /dev, so inherited terminal
   // descriptors have no path inside the sandbox. Without the flag, fstat(0)
   // fails with EACCES and Node aborts at startup. Attached names still go

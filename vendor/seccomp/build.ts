@@ -53,15 +53,20 @@ run([
 
 const blockedBpf: Record<string, Buffer> = {}
 const allowlistBpf: Record<string, Buffer> = {}
+const keyringBpf: Record<string, Buffer> = {}
 for (const target of ['x86_64', 'aarch64']) {
   const blockedTmp = join(OUT, target + '-blocked.bpf')
   const allowlistTmp = join(OUT, target + '-allowlist.bpf')
+  const keyringTmp = join(OUT, target + '-keyring.bpf')
   run([gen, blockedTmp, 'block', target])
   run([gen, allowlistTmp, 'allowlist', target])
+  run([gen, keyringTmp, 'keyring', target])
   blockedBpf[target] = readFileSync(blockedTmp)
   allowlistBpf[target] = readFileSync(allowlistTmp)
+  keyringBpf[target] = readFileSync(keyringTmp)
   rmSync(blockedTmp)
   rmSync(allowlistTmp)
+  rmSync(keyringTmp)
 }
 rmSync(gen)
 
@@ -75,12 +80,18 @@ writeFileSync(
     'static const unsigned char unix_allowlist_bpf[] = {\n' +
     toCArray(allowlistBpf.x86_64) +
     '\n};\n' +
+    'static const unsigned char keyring_block_bpf[] = {\n' +
+    toCArray(keyringBpf.x86_64) +
+    '\n};\n' +
     '#elif defined(__aarch64__)\n' +
     'static const unsigned char unix_block_bpf[] = {\n' +
     toCArray(blockedBpf.aarch64) +
     '\n};\n' +
     'static const unsigned char unix_allowlist_bpf[] = {\n' +
     toCArray(allowlistBpf.aarch64) +
+    '\n};\n' +
+    'static const unsigned char keyring_block_bpf[] = {\n' +
+    toCArray(keyringBpf.aarch64) +
     '\n};\n' +
     '#else\n' +
     '#error "unsupported architecture for unix-block BPF filter"\n' +
